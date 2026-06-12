@@ -1,0 +1,24 @@
+[package]
+name = "autoagents-tool-auth"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Tool permission framework for AutoAgents - Safe/Write/System/Destructive levels"
+repository.workspace = true
+keywords.workspace = true
+categories.workspace = true
+
+[dependencies]
+autoagents.workspace = true
+autoagents-core.workspace = true
+autoagents-derive.workspace = true
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+regex = { workspace = true }
+async-trait = { workspace = true }
+log = { workspace = true }
+chrono = { workspace = true }
+
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+tokio = { workspace = true }

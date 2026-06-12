@@ -1,0 +1,80 @@
+// This example demonstrates various LLM Provider methods
+use autoagents::llm::builder::{FunctionBuilder, ParamBuilder};
+use autoagents::{
+    llm::{LLMProvider, chat::ChatMessage},
+    prelude::Error,
+};
+use std::slice;
+use std::sync::Arc;
+use tokio_stream::StreamExt;
+
+pub async fn run_llm(llm: Arc<dyn LLMProvider>) -> Result<(), Error> {
+    let message = ChatMessage::user().content("Hello, Who are you?").build();
+
+    //Single Chat Request
+    let chat_response = llm.chat(slice::from_ref(&message), None).await?;
+    println!("Chat Response: {:?}", chat_response);
+
+    //Stream without structured output
+    let mut stream = llm.chat_stream(slice::from_ref(&message), None).await?;
+    while let Some(result) = stream.next().await {
+        if let Ok(output) = result {
+            println!("Streaming Response: {}", output);
+        }
+    }
+    println!("Running Stram with structured");
+
+    //Stream with structured output
+    let mut stream = llm
+        .chat_stream_struct(slice::from_ref(&message), None, None)
+        .await?;
+    while let Some(result) = stream.next().await {
+        if let Ok(output) = result {
+            println!("Streaming Response: {:?}", output);
+        }
+    }
+    println!("Running Stram With Tool struct");
+
+    let tool = FunctionBuilder::new("weather_function")
+        .description("Use this tool to get the weather in a specific city")
+        .param(
+            ParamBuilder::new("city")
+                .type_of("string")
+                .description("The city to get the weather for"),
+        )
+        .required(vec!["city".to_string()])
+        .build();
+
+    //Stream with structured output
+    let message = ChatMessage::user()
+        .content("Hello, What is the current weather in new york?")
+        .build();
+    let mut stream = llm
+        .chat_stream_struct(
+            slice::from_ref(&message),
+            Some(slice::from_ref(&tool)),
+            None,
+        )
+        .await?;
+    while let Some(result) = stream.next().await {
+        if let Ok(output) = result {
+            println!("Streaming Response: {:?}", output);
+        }
+    }
+
+    println!("Running Stram With Tool");
+    //Stream with structured output
+    let message = ChatMessage::user()
+        .content("Hello, What is the current weather in new york?")
+        .build();
+    let mut stream = llm
+        .chat_stream_with_tools(slice::from_ref(&message), Some(&[tool]), None)
+        .await?;
+    while let Some(result) = stream.next().await {
+        if let Ok(output) = result {
+            println!("Streaming Response: {:?}", output);
+        }
+    }
+
+    Ok(())
+}

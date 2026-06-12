@@ -1,0 +1,57 @@
+[package]
+name = "autoagents-toolkit"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description.workspace = true
+repository.workspace = true
+keywords.workspace = true
+categories.workspace = true
+readme.workspace = true
+
+[features]
+default = []
+full = ["mcp", "filesystem", "search", "wolfram-alpha", "document-parsing"]
+mcp = ["rmcp", "toml"]
+filesystem = []
+search = ["reqwest", "once_cell"]
+wolfram-alpha = ["reqwest", "once_cell"]
+document-parsing = [
+  "reqwest",
+  "pdf-extract",
+  "zip",
+  "quick-xml",
+  "calamine",
+  "html2text",
+  "csv",
+]
+
+[dependencies]
+autoagents.workspace = true
+autoagents-derive.workspace = true
+serde = { workspace = true }
+serde_json = { workspace = true }
+reqwest = { workspace = true, optional = true }
+log = { workspace = true }
+once_cell = { workspace = true, optional = true }
+base64 = { workspace = true }
+walkdir = { workspace = true }
+toml = { workspace = true, optional = true }
+thiserror = { workspace = true }
+pdf-extract = { workspace = true, optional = true }
+zip = { workspace = true, optional = true }
+quick-xml = { workspace = true, optional = true }
+calamine = { workspace = true, optional = true }
+html2text = { workspace = true, optional = true }
+csv = { workspace = true, optional = true }
+rmcp = { workspace = true, optional = true, features = [
+  "client",
+  "transport-child-process",
+  "transport-streamable-http-client-reqwest",
+] }
+
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+tokio = { workspace = true }
+
+[dev-dependencies]
+tempfile.workspace = true

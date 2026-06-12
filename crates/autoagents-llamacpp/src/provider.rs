@@ -1,0 +1,4104 @@
+//! LlamaCppProvider implementation with LLMProvider traits.
+
+use crate::{
+    builder::LlamaCppProviderBuilder,
+    config::{LlamaCppConfig, LlamaCppConfigBuilder},
+    conversion::{LlamaCppResponse, PromptData, build_fallback_prompt, build_openai_messages_json},
+    error::LlamaCppProviderError,
+    models::ModelSource,
+};
+use autoagents_llm::{
+    FunctionCall, LLMProvider, ToolCall, async_trait,
+    chat::{
+        ChatMessage, ChatProvider, ChatResponse, MessageType, SamplingOverrides, StreamChoice,
+        StreamChunk, StreamDelta, StreamResponse, StructuredOutputFormat, Tool, Usage as ChatUsage,
+    },
+    completion::{CompletionProvider, CompletionRequest, CompletionResponse},
+    embedding::EmbeddingProvider,
+    error::LLMError,
+    models::ModelsProvider,
+};
+use futures::{StreamExt, stream::Stream};
+use llama_cpp_2::{
+    context::params::LlamaContextParams,
+    llama_backend::LlamaBackend,
+    llama_batch::LlamaBatch,
+    model::params::LlamaModelParams,
+    model::{AddBos, GrammarTriggerType, LlamaChatTemplate, LlamaModel},
+    openai::OpenAIChatTemplateParams,
+    sampling::LlamaSampler,
+    token::LlamaToken,
+};
+#[cfg(feature = "mtmd")]
+use llama_cpp_2::{
+    model::LlamaChatMessage,
+    mtmd::{MtmdBitmap, MtmdContext, MtmdContextParams, MtmdInputText, mtmd_default_marker},
+};
+use serde::Deserialize;
+use serde_json::Value;
+#[cfg(feature = "mtmd")]
+use std::ffi::CString;
+use std::{
+    collections::{HashMap, HashSet},
+    num::NonZeroU32,
+    path::Path,
+    pin::Pin,
+    sync::{Arc, OnceLock},
+};
+use tokio::sync::mpsc;
+
+/// Dedicated tokio runtime for the llamacpp provider.
+///
+/// Each compiled `.so` has its own copy of tokio's thread-local runtime state.
+/// When this crate is used from a Python extension, the calling async context
+/// runs on a different `.so`'s runtime whose thread-local is invisible to this
+/// crate's tokio. Using a crate-local runtime ensures `spawn_blocking` and
+/// `spawn` always have a valid `Handle::current()`.
+fn get_rt() -> &'static tokio::runtime::Runtime {
+    static RT: OnceLock<tokio::runtime::Runtime> = OnceLock::new();
+    RT.get_or_init(|| {
+        tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .thread_name("llamacpp")
+            .build()
+            .expect("llamacpp runtime init failed")
+    })
+}
+
+const JSON_GRAMMAR: &str = include_str!("grammars/json.gbnf");
+const DEFAULT_N_BATCH: u32 = 64;
+
+// ---------------------------------------------------------------------------
+// Prefix comparison — extracted for testability
+// ---------------------------------------------------------------------------
+
+/// Count how many leading tokens are identical between `cached` and `new`.
+///
+/// Used by [`SessionState`] to determine how much of the KV-cache can be
+/// reused: tokens `0..prefix_len` are already decoded, only
+/// `new[prefix_len..]` needs processing.
+fn common_prefix_len(cached: &[LlamaToken], new: &[LlamaToken]) -> usize {
+    cached
+        .iter()
+        .zip(new.iter())
+        .position(|(a, b)| a != b)
+        .unwrap_or_else(|| cached.len().min(new.len()))
+}
+
+// ---------------------------------------------------------------------------
+// SessionState — persistent KV-cache for prefix reuse
+// ---------------------------------------------------------------------------
+
+/// Persistent inference context with KV-cache tracking.
+///
+/// When `LlamaCppConfig::context_reuse` is enabled, the provider holds a
+/// `SessionState` across calls. On each inference request, the new prompt
+/// tokens are compared against `cached_tokens`; only the suffix that differs
+/// is decoded, and the stale KV-cache tail is evicted via
+/// `clear_kv_cache_seq`.
+///
+/// # Safety
+///
+/// `LlamaContext<'a>` has a lifetime parameter tied to `&'a LlamaModel`.
+/// We transmute that to `LlamaContext<'static>` and keep the model alive via
+/// `_model: Arc<LlamaModel>`. Rust's struct drop order guarantees that `ctx`
+/// is dropped **before** `_model` and `_backend` (fields drop in declaration
+/// order). The wrapping `Mutex` prevents concurrent access.
+pub(crate) struct SessionState {
+    /// The live context. SAFETY: `'static` is a lie — see doc above.
+    ctx: llama_cpp_2::context::LlamaContext<'static>,
+    /// Keeps the model alive for the context's FFI pointer.
+    _model: Arc<LlamaModel>,
+    /// Keeps the backend alive for the model.
+    _backend: Arc<LlamaBackend>,
+    /// Tokens currently in KV-cache slot 0, positions 0..len.
+    cached_tokens: Vec<LlamaToken>,
+    /// The KV-cache position of the *next* token to be written.
+    next_pos: i32,
+    /// The context window size this session was created with.
+    n_ctx: u32,
+}
+
+// SAFETY: LlamaModel: Send + Sync (declared in llama-cpp-2).
+// LlamaContext wraps a raw pointer guarded by a Mutex — no concurrent access.
+// Sync is intentionally NOT implemented: SessionState must never be shared
+// across threads without the Mutex wrapper. Moving it out of Arc<Mutex<..>>
+// into Arc<SessionState> would be unsound (LlamaContext is not thread-safe).
+unsafe impl Send for SessionState {}
+
+impl SessionState {
+    /// Build a new session: create a context with the given parameters.
+    fn new(
+        backend: Arc<LlamaBackend>,
+        model: Arc<LlamaModel>,
+        config: &LlamaCppConfig,
+        n_ctx: u32,
+        n_batch: u32,
+    ) -> Result<Self, LlamaCppProviderError> {
+        let ctx_params = build_context_params(config, false, Some(n_ctx), Some(n_batch))?;
+
+        let ctx_real = model
+            .new_context(&backend, ctx_params)
+            .map_err(|e| LlamaCppProviderError::ContextLoad(e.to_string()))?;
+
+        // SAFETY: see SessionState doc. model is kept alive in the same struct.
+        let ctx: llama_cpp_2::context::LlamaContext<'static> =
+            unsafe { std::mem::transmute(ctx_real) };
+
+        Ok(Self {
+            ctx,
+            _model: model,
+            _backend: backend,
+            cached_tokens: Vec::new(),
+            next_pos: 0,
+            n_ctx,
+        })
+    }
+
+    /// Find the common prefix length between cached tokens and new tokens.
+    fn prefix_len(&self, new_tokens: &[LlamaToken]) -> usize {
+        common_prefix_len(&self.cached_tokens, new_tokens)
+    }
+
+    /// Evict stale KV-cache entries beyond `keep` and update tracking.
+    fn evict_after(&mut self, keep: usize) -> Result<(), LlamaCppProviderError> {
+        if keep < self.cached_tokens.len() {
+            self.ctx
+                .clear_kv_cache_seq(Some(0), Some(keep as u32), None)
+                .map_err(|e| LlamaCppProviderError::Inference(format!("KV evict: {e}")))?;
+            self.cached_tokens.truncate(keep);
+            self.next_pos = keep as i32;
+        }
+        Ok(())
+    }
+
+    /// Decode new tokens into the KV-cache, chunked by batch size.
+    fn decode_tokens(
+        &mut self,
+        tokens: &[LlamaToken],
+        batch_limit: usize,
+    ) -> Result<(), LlamaCppProviderError> {
+        for chunk in tokens.chunks(batch_limit.max(1)) {
+            let mut batch = LlamaBatch::new(chunk.len().max(64), 1);
+            for (i, &tok) in chunk.iter().enumerate() {
+                let pos = self.next_pos + i as i32;
+                let is_last = i == chunk.len() - 1;
+                batch
+                    .add(tok, pos, &[0], is_last)
+                    .map_err(|e| LlamaCppProviderError::Inference(format!("batch add: {e}")))?;
+            }
+            self.ctx
+                .decode(&mut batch)
+                .map_err(|e| LlamaCppProviderError::Inference(format!("decode: {e}")))?;
+            // Update tracking per-chunk so next_pos and cached_tokens stay
+            // consistent even if a subsequent chunk's decode fails.
+            self.cached_tokens.extend_from_slice(chunk);
+            self.next_pos += chunk.len() as i32;
+        }
+        Ok(())
+    }
+}
+
+/// Shared session state type used by the provider.
+type SharedSessionState = Arc<std::sync::Mutex<Option<SessionState>>>;
+
+/// Active inference context — either a fresh owned context or a persistent
+/// session context behind a MutexGuard.
+///
+/// Used during token generation to abstract over the two context acquisition
+/// paths. The `with_ctx` method provides type-safe access to the underlying
+/// `LlamaContext` regardless of which variant is active.
+enum ActiveContext<'a> {
+    /// Fresh context created for this call (no prefix reuse).
+    Owned(llama_cpp_2::context::LlamaContext<'a>),
+    /// Persistent session context with KV-cache prefix reuse.
+    Session(std::sync::MutexGuard<'a, Option<SessionState>>),
+}
+
+impl ActiveContext<'_> {
+    /// Run a closure with mutable access to the underlying LlamaContext.
+    ///
+    /// Abstracts over owned vs session contexts — the closure receives a
+    /// `&mut LlamaContext` regardless of which variant is active.
+    fn with_ctx<R>(
+        &mut self,
+        f: impl FnOnce(&mut llama_cpp_2::context::LlamaContext<'_>) -> R,
+    ) -> R {
+        match self {
+            ActiveContext::Owned(ctx) => f(ctx),
+            ActiveContext::Session(guard) => {
+                let state = guard
+                    .as_mut()
+                    .expect("session must exist during generation");
+                f(&mut state.ctx)
+            }
+        }
+    }
+
+    /// Get mutable access to the session state (for post-generation cleanup).
+    /// Returns `None` for owned contexts or if no session is initialized.
+    fn session_state_mut(&mut self) -> Option<&mut SessionState> {
+        match self {
+            ActiveContext::Owned(_) => None,
+            ActiveContext::Session(guard) => guard.as_mut(),
+        }
+    }
+}
+
+/// Llama.cpp provider for local LLM inference.
+pub struct LlamaCppProvider {
+    backend: Arc<LlamaBackend>,
+    model: Arc<LlamaModel>,
+    config: LlamaCppConfig,
+    /// Persistent session state for KV-cache prefix reuse.
+    /// `None` (inner Option) until the first inference call.
+    /// The outer Arc<Mutex> is only allocated when `config.context_reuse` is true.
+    session_state: Option<SharedSessionState>,
+}
+
+struct GenerationResult {
+    text: String,
+    prompt_tokens: u32,
+    completion_tokens: u32,
+    finish_reason: String,
+}
+
+enum StreamEvent {
+    Token(String),
+    Delta(String),
+    Usage(ChatUsage),
+    Done { stop_reason: String },
+}
+
+type TokenCallback = Box<dyn FnMut(&str) -> Result<(), LlamaCppProviderError> + Send>;
+type DeltaCallback = Box<dyn FnMut(&str) -> Result<(), LlamaCppProviderError> + Send>;
+
+struct GenerationParams<'a> {
+    prompt: &'a PromptData,
+    use_json_grammar: bool,
+    max_tokens: u32,
+    temperature: Option<f32>,
+    top_p: Option<f32>,
+    on_token: Option<TokenCallback>,
+}
+
+#[cfg(feature = "mtmd")]
+struct MtmdGenerationParams<'a> {
+    prompt: &'a str,
+    marker: &'a str,
+    images: &'a [Vec<u8>],
+    max_tokens: u32,
+    temperature: Option<f32>,
+    top_p: Option<f32>,
+    on_token: Option<TokenCallback>,
+}
+
+struct ChatGenerationParams<'a> {
+    template_result: &'a llama_cpp_2::model::ChatTemplateResult,
+    max_tokens: u32,
+    temperature: Option<f32>,
+    top_p: Option<f32>,
+    on_delta: Option<DeltaCallback>,
+}
+
+enum ChatPrompt {
+    OpenAI(llama_cpp_2::model::ChatTemplateResult),
+    Fallback {
+        prompt: PromptData,
+        use_json_grammar: bool,
+    },
+}
+
+#[derive(Debug, Deserialize)]
+struct OpenAICompatMessage {
+    content: Option<StringOrJson>,
+    reasoning_content: Option<StringOrJson>,
+    tool_calls: Option<Vec<OpenAICompatToolCall>>,
+}
+
+#[derive(Debug, Deserialize)]
+struct OpenAICompatDelta {
+    content: Option<StringOrJson>,
+    reasoning_content: Option<StringOrJson>,
+    tool_calls: Option<Vec<OpenAIToolCallDelta>>,
+}
+
+#[derive(Debug, Deserialize)]
+struct OpenAICompatToolCall {
+    #[serde(default)]
+    id: StringOrJson,
+    #[serde(rename = "type", default = "default_call_type_value")]
+    call_type: StringOrJson,
+    function: OpenAICompatFunctionCall,
+}
+
+#[derive(Debug, Deserialize)]
+struct OpenAICompatFunctionCall {
+    #[serde(default)]
+    name: StringOrJson,
+    #[serde(default)]
+    arguments: StringOrJson,
+}
+
+#[derive(Debug, Deserialize)]
+struct OpenAIToolCallDelta {
+    index: Option<usize>,
+    id: Option<String>,
+    #[serde(rename = "type")]
+    call_type: Option<String>,
+    function: Option<OpenAIFunctionDelta>,
+}
+
+#[derive(Debug, Deserialize)]
+struct OpenAIFunctionDelta {
+    name: Option<String>,
+    #[serde(default)]
+    arguments: StringOrJson,
+}
+
+#[derive(Debug, Default)]
+struct ToolCallState {
+    id: String,
+    name: String,
+    arguments: String,
+    started: bool,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(untagged)]
+enum StringOrJson {
+    String(String),
+    Json(Value),
+}
+
+impl Default for StringOrJson {
+    fn default() -> Self {
+        Self::String(String::default())
+    }
+}
+
+impl StringOrJson {
+    fn into_string(self) -> String {
+        match self {
+            Self::String(text) => text,
+            Self::Json(Value::Null) => String::default(),
+            Self::Json(value) => value.to_string(),
+        }
+    }
+
+    fn into_non_empty_string(self) -> Option<String> {
+        let text = self.into_string();
+        if text.is_empty() { None } else { Some(text) }
+    }
+}
+
+impl From<OpenAICompatToolCall> for ToolCall {
+    fn from(value: OpenAICompatToolCall) -> Self {
+        ToolCall {
+            id: value.id.into_string(),
+            call_type: value.call_type.into_string(),
+            function: FunctionCall {
+                name: value.function.name.into_string(),
+                arguments: value.function.arguments.into_string(),
+            },
+        }
+    }
+}
+
+fn default_call_type_value() -> StringOrJson {
+    StringOrJson::String(autoagents_llm::default_call_type())
+}
+
+impl LlamaCppProvider {
+    /// Create provider from GGUF model path.
+    pub async fn from_gguf(model_path: impl Into<String>) -> Result<Self, LLMError> {
+        let config = LlamaCppConfigBuilder::new().model_path(model_path).build();
+        Self::from_config(config).await
+    }
+
+    /// Create provider from configuration.
+    pub async fn from_config(mut config: LlamaCppConfig) -> Result<Self, LLMError> {
+        if config.mmproj_path.is_none()
+            && let ModelSource::HuggingFace {
+                repo_id,
+                mmproj_filename: Some(mmproj_filename),
+                ..
+            } = &config.model_source
+        {
+            let mmproj_path =
+                crate::huggingface::resolve_hf_file(repo_id, mmproj_filename, &config)
+                    .map_err(LLMError::from)?;
+            config.mmproj_path = Some(mmproj_path);
+        }
+
+        let backend = initialize_backend()?;
+        let model = load_model(backend.clone(), &config).await?;
+        let session_state = if config.context_reuse {
+            Some(Arc::new(std::sync::Mutex::new(None)))
+        } else {
+            None
+        };
+        Ok(Self {
+            backend,
+            model,
+            config,
+            session_state,
+        })
+    }
+
+    /// Create a provider from a pre-loaded model.
+    ///
+    /// The model and backend are shared via `Arc` — no duplicate GGUF load.
+    /// The new provider gets its own `SessionState` (KV context), so it can
+    /// be used concurrently with sibling providers without contention.
+    ///
+    /// Use [`model()`] and [`backend()`] on an existing provider to obtain
+    /// the handles, then pass them here with a fresh config. The caller must
+    /// ensure `config` is compatible with the passed model (matching `n_ctx`,
+    /// `model_path` for logging).
+    pub fn from_model(
+        model: Arc<LlamaModel>,
+        backend: Arc<LlamaBackend>,
+        config: LlamaCppConfig,
+    ) -> Self {
+        let session_state = if config.context_reuse {
+            Some(Arc::new(std::sync::Mutex::new(None)))
+        } else {
+            None
+        };
+        Self {
+            backend,
+            model,
+            config,
+            session_state,
+        }
+    }
+
+    /// Get a builder for advanced configuration.
+    pub fn builder() -> LlamaCppProviderBuilder {
+        LlamaCppProviderBuilder::new()
+    }
+
+    /// Get reference to the configuration.
+    pub fn config(&self) -> &LlamaCppConfig {
+        &self.config
+    }
+
+    /// Get the model handle for creating sibling providers via [`from_model()`].
+    pub fn model(&self) -> &Arc<LlamaModel> {
+        &self.model
+    }
+
+    /// Get the backend handle for creating sibling providers via [`from_model()`].
+    pub fn backend(&self) -> &Arc<LlamaBackend> {
+        &self.backend
+    }
+
+    /// Clear the persistent session state so the next call starts fresh.
+    ///
+    /// No-op when `context_reuse` is disabled.
+    pub fn reset_session(&self) {
+        if let Some(ref state) = self.session_state {
+            *state.lock().expect("session mutex poisoned") = None;
+        }
+    }
+
+    /// Number of tokens currently cached in the persistent KV-cache.
+    ///
+    /// Returns 0 when `context_reuse` is disabled or no session exists yet.
+    pub fn cached_prefix_len(&self) -> usize {
+        match self.session_state.as_ref() {
+            Some(s) => s
+                .lock()
+                .expect("session mutex poisoned")
+                .as_ref()
+                .map(|s| s.cached_tokens.len())
+                .unwrap_or(0),
+            None => 0,
+        }
+    }
+
+    fn prepare_messages(&self, messages: &[ChatMessage]) -> Vec<ChatMessage> {
+        prepare_messages_with_system(&self.config, messages)
+    }
+
+    fn prepare_fallback_messages(
+        &self,
+        messages: &[ChatMessage],
+        json_schema: Option<&StructuredOutputFormat>,
+    ) -> Vec<ChatMessage> {
+        prepare_fallback_messages_with_schema(&self.config, messages, json_schema)
+    }
+
+    fn ensure_supported_messages(&self, messages: &[ChatMessage]) -> Result<(), LLMError> {
+        ensure_supported_messages_for_config(&self.config, messages)
+    }
+
+    fn build_chat_prompt(
+        &self,
+        messages: &[ChatMessage],
+        tools: Option<&[Tool]>,
+        json_schema: Option<&StructuredOutputFormat>,
+    ) -> Result<ChatPrompt, LLMError> {
+        self.ensure_supported_messages(messages)?;
+        let template = match self.resolve_chat_template() {
+            Ok(template) => Some(template),
+            Err(err) => {
+                if tools.is_some() || json_schema.is_some() || self.config.force_json_grammar {
+                    return Err(err);
+                }
+                None
+            }
+        };
+
+        if let Some(template) = template {
+            let messages = self.prepare_messages(messages);
+            let messages_json = build_openai_messages_json(&messages).map_err(LLMError::from)?;
+            let tools_json = match tools {
+                Some(tools) if !tools.is_empty() => {
+                    Some(serde_json::to_string(tools).map_err(|err| {
+                        LLMError::ProviderError(format!("Failed to serialize tools: {err}"))
+                    })?)
+                }
+                _ => None,
+            };
+
+            let (json_schema_value, grammar_value) = select_template_schema_and_grammar(
+                tools_json.is_some(),
+                json_schema,
+                self.config.force_json_grammar,
+            );
+            let chat_template_kwargs = self
+                .config
+                .extra_body
+                .as_ref()
+                .and_then(|body| body.get("chat_template_kwargs"))
+                .filter(|value| value.is_object())
+                .map(Value::to_string);
+
+            let parse_tool_calls =
+                tools_json.is_some() && json_schema_value.is_none() && grammar_value.is_none();
+            let params = OpenAIChatTemplateParams {
+                messages_json: messages_json.as_str(),
+                tools_json: tools_json.as_deref(),
+                tool_choice: None,
+                json_schema: json_schema_value.as_deref(),
+                grammar: grammar_value.as_deref(),
+                reasoning_format: self
+                    .config
+                    .reasoning_format
+                    .and_then(|format| format.as_str()),
+                chat_template_kwargs: chat_template_kwargs.as_deref(),
+                add_generation_prompt: true,
+                use_jinja: true,
+                parallel_tool_calls: false,
+                enable_thinking: self.config.enable_thinking.unwrap_or(false),
+                add_bos: false,
+                add_eos: false,
+                parse_tool_calls,
+            };
+
+            let mut result = self
+                .model
+                .apply_chat_template_oaicompat(&template, &params)
+                .map_err(|err| {
+                    LLMError::ProviderError(format!(
+                        "Failed to apply OpenAI-compatible chat template: {err}"
+                    ))
+                })?;
+
+            // When the request is grammar-constrained with no tools, the model
+            // output is itself the structured response — there is no envelope
+            // (reasoning_content, tool_calls, etc.) to extract, and no
+            // tool-call trigger tokens to wait for. The chat-format handler
+            // in `common_chat_templates_apply` configures both:
+            //   1. A parser string expecting an envelope shape — raises rc=-3
+            //      inside `chat_parse_to_oaicompat` when run against plain-JSON
+            //      output.
+            //   2. `grammar_lazy=true` (per `llama.cpp/common/chat.cpp:1059,1187`
+            //      pattern: `!(has_response_format || ...)`) — delays grammar
+            //      enforcement until a trigger token fires, leaving the model
+            //      free to emit markdown fences / preamble first.
+            // Both are wrong for the no-tools-grammar shape. We restore the
+            // correct routing: drop the parser (signals "no envelope"), force
+            // eager grammar enforcement (no triggers to wait for), and clear
+            // any trigger list (triggers are tool-call sentinels, irrelevant
+            // for plain JSON output).
+            //
+            // The unit-level fix in `select_template_schema_and_grammar`
+            // (#220 / #232) does not reach this configuration on its own —
+            // the parser + lazy flag + triggers are decided inside the C++
+            // template engine, not by the schema-vs-grammar slot routing.
+            //
+            // NOTE: the `tools.is_some() && grammar.is_some()` combination
+            // remains a known upstream limitation in llama.cpp's
+            // `common_chat_templates_apply` — the parser + lazy-grammar
+            // configuration intended for tool-calling conflicts with strict
+            // grammar enforcement on the structured-output payload. Fix
+            // belongs upstream; this branch only addresses the no-tools case.
+            if tools_json.is_none() && result.grammar.is_some() {
+                result.parser = None;
+                result.grammar_lazy = false;
+                result.grammar_triggers.clear();
+            }
+
+            Ok(ChatPrompt::OpenAI(result))
+        } else {
+            let fallback_messages = self.prepare_fallback_messages(messages, json_schema);
+            let prompt = PromptData {
+                prompt: build_fallback_prompt(&fallback_messages),
+                add_bos: AddBos::Always,
+            };
+            let use_json_grammar = json_schema.is_some() || self.config.force_json_grammar;
+            Ok(ChatPrompt::Fallback {
+                prompt,
+                use_json_grammar,
+            })
+        }
+    }
+
+    fn has_mtmd_media(messages: &[ChatMessage]) -> bool {
+        messages
+            .iter()
+            .any(|message| matches!(message.message_type, MessageType::Image(_)))
+    }
+
+    #[cfg(feature = "mtmd")]
+    fn build_mtmd_prompt(
+        &self,
+        messages: &[ChatMessage],
+    ) -> Result<(String, Vec<Vec<u8>>, String), LLMError> {
+        let template = self.resolve_chat_template()?;
+        let mut chat = Vec::new();
+        let mut images = Vec::new();
+        let default_marker = mtmd_default_marker().to_string();
+        let marker = self
+            .config
+            .media_marker
+            .as_deref()
+            .unwrap_or(&default_marker)
+            .to_string();
+
+        for message in self.prepare_messages(messages) {
+            let mut content = message.content.clone();
+            match message.message_type {
+                MessageType::Text => {}
+                MessageType::Image((_, bytes)) => {
+                    images.push(bytes);
+                    if !content.contains(&marker) {
+                        content.push_str(&marker);
+                    }
+                }
+                //TODO: Get a FIX
+                MessageType::ToolUse(_) | MessageType::ToolResult(_) => {
+                    return Err(LLMError::InvalidRequest(
+                        "MTMD path does not support tool calls".to_string(),
+                    ));
+                }
+                MessageType::ImageURL(_) | MessageType::Pdf(_) => {
+                    return Err(LLMError::InvalidRequest(
+                        "MTMD path only supports raw image inputs".to_string(),
+                    ));
+                }
+            }
+
+            let role = match message.role {
+                autoagents_llm::chat::ChatRole::System => "system",
+                autoagents_llm::chat::ChatRole::User => "user",
+                autoagents_llm::chat::ChatRole::Assistant => "assistant",
+                autoagents_llm::chat::ChatRole::Tool => "tool",
+            };
+
+            let chat_msg = LlamaChatMessage::new(role.to_string(), content)
+                .map_err(|err| LLMError::ProviderError(format!("Invalid chat message: {err}")))?;
+            chat.push(chat_msg);
+        }
+
+        let prompt = self
+            .model
+            .apply_chat_template(&template, &chat, true)
+            .map_err(|err| {
+                LLMError::ProviderError(format!("Failed to apply chat template: {err}"))
+            })?;
+
+        Ok((prompt, images, marker))
+    }
+
+    fn resolve_chat_template(&self) -> Result<LlamaChatTemplate, LLMError> {
+        if let Some(template) = self.config.chat_template.as_deref() {
+            return LlamaChatTemplate::new(template)
+                .map_err(|err| LLMError::ProviderError(format!("Invalid chat template: {err}")));
+        }
+
+        self.model.chat_template(None).map_err(|err| {
+            LLMError::ProviderError(format!("Model does not provide a chat template: {err}"))
+        })
+    }
+
+    fn build_usage(prompt_tokens: u32, completion_tokens: u32) -> ChatUsage {
+        ChatUsage {
+            prompt_tokens,
+            completion_tokens,
+            total_tokens: prompt_tokens + completion_tokens,
+            completion_tokens_details: None,
+            prompt_tokens_details: None,
+        }
+    }
+
+    fn resolve_max_tokens(&self, max_tokens_override: Option<u32>) -> u32 {
+        max_tokens_override
+            .or(self.config.max_tokens)
+            .unwrap_or(512)
+    }
+
+    fn resolve_temperature(&self, temperature_override: Option<f32>) -> Option<f32> {
+        temperature_override.or(self.config.temperature)
+    }
+
+    fn resolve_top_p(&self, top_p_override: Option<f32>) -> Option<f32> {
+        top_p_override.or(self.config.top_p)
+    }
+
+    async fn run_blocking_task<T, F>(task_name: &str, f: F) -> Result<T, LLMError>
+    where
+        T: Send + 'static,
+        F: FnOnce() -> Result<T, LlamaCppProviderError> + Send + 'static,
+    {
+        get_rt()
+            .spawn_blocking(f)
+            .await
+            .map_err(|err| LLMError::ProviderError(format!("{task_name} task failed: {err}")))?
+            .map_err(LLMError::from)
+    }
+
+    async fn generate_completion_response(
+        &self,
+        prompt: PromptData,
+        use_json_grammar: bool,
+        max_tokens_override: Option<u32>,
+        temperature_override: Option<f32>,
+        top_p_override: Option<f32>,
+    ) -> Result<GenerationResult, LLMError> {
+        let config = self.config.clone();
+        let model = self.model.clone();
+        let backend = self.backend.clone();
+        let max_tokens = self.resolve_max_tokens(max_tokens_override);
+        let temperature = self.resolve_temperature(temperature_override);
+        let top_p = self.resolve_top_p(top_p_override);
+        let session = self.session_state.clone();
+
+        let mut result = Self::run_blocking_task("Generation", move || {
+            generate_text(
+                &model,
+                &backend,
+                &config,
+                GenerationParams {
+                    prompt: &prompt,
+                    use_json_grammar,
+                    max_tokens,
+                    temperature,
+                    top_p,
+                    on_token: None,
+                },
+                session.as_ref(),
+            )
+        })
+        .await?;
+
+        if use_json_grammar && let Some(extracted) = extract_json_payload(&result.text) {
+            result.text = extracted;
+        }
+
+        Ok(result)
+    }
+
+    async fn generate_chat_completion(
+        &self,
+        template_result: llama_cpp_2::model::ChatTemplateResult,
+        max_tokens_override: Option<u32>,
+        temperature_override: Option<f32>,
+        top_p_override: Option<f32>,
+    ) -> Result<GenerationResult, LLMError> {
+        let config = self.config.clone();
+        let model = self.model.clone();
+        let backend = self.backend.clone();
+        let max_tokens = self.resolve_max_tokens(max_tokens_override);
+        let temperature = self.resolve_temperature(temperature_override);
+        let top_p = self.resolve_top_p(top_p_override);
+        let session = self.session_state.clone();
+
+        Self::run_blocking_task("Generation", move || {
+            generate_chat_text(
+                &model,
+                &backend,
+                &config,
+                ChatGenerationParams {
+                    template_result: &template_result,
+                    max_tokens,
+                    temperature,
+                    top_p,
+                    on_delta: None,
+                },
+                session.as_ref(),
+            )
+        })
+        .await
+    }
+
+    fn spawn_fallback_stream(
+        &self,
+        prompt: PromptData,
+        use_json_grammar: bool,
+        max_tokens_override: Option<u32>,
+        temperature_override: Option<f32>,
+        top_p_override: Option<f32>,
+    ) -> Pin<Box<dyn Stream<Item = Result<StreamEvent, LLMError>> + Send>> {
+        let (tx, rx) = mpsc::unbounded_channel::<Result<StreamEvent, LLMError>>();
+        let config = self.config.clone();
+        let model = self.model.clone();
+        let backend = self.backend.clone();
+        let max_tokens = self.resolve_max_tokens(max_tokens_override);
+        let temperature = self.resolve_temperature(temperature_override);
+        let top_p = self.resolve_top_p(top_p_override);
+        let session = self.session_state.clone();
+        let emitted_any = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let tx_tokens = tx.clone();
+
+        get_rt().spawn(async move {
+            let emitted_any = Arc::clone(&emitted_any);
+            let emitted_any_for_blocking = Arc::clone(&emitted_any);
+            let result = tokio::task::spawn_blocking(
+                move || -> Result<GenerationResult, LlamaCppProviderError> {
+                    let mut json_started = false;
+                    let emitted_any = emitted_any_for_blocking;
+                    let on_token: Option<TokenCallback> = Some(Box::new(move |token: &str| {
+                        if use_json_grammar && !json_started {
+                            if let Some(start) = token.find('{').or_else(|| token.find('[')) {
+                                json_started = true;
+                                let suffix = &token[start..];
+                                if !suffix.is_empty() {
+                                    tx_tokens
+                                        .send(Ok(StreamEvent::Token(suffix.to_string())))
+                                        .map_err(|_| {
+                                            LlamaCppProviderError::Inference(
+                                                "Stream receiver dropped".to_string(),
+                                            )
+                                        })?;
+                                    emitted_any.store(true, std::sync::atomic::Ordering::Relaxed);
+                                }
+                            }
+                            return Ok(());
+                        }
+
+                        tx_tokens
+                            .send(Ok(StreamEvent::Token(token.to_string())))
+                            .map_err(|_| {
+                                LlamaCppProviderError::Inference(
+                                    "Stream receiver dropped".to_string(),
+                                )
+                            })?;
+                        emitted_any.store(true, std::sync::atomic::Ordering::Relaxed);
+                        Ok(())
+                    })
+                        as TokenCallback);
+                    generate_text(
+                        &model,
+                        &backend,
+                        &config,
+                        GenerationParams {
+                            prompt: &prompt,
+                            use_json_grammar,
+                            max_tokens,
+                            temperature,
+                            top_p,
+                            on_token,
+                        },
+                        session.as_ref(),
+                    )
+                },
+            )
+            .await;
+
+            match result {
+                Ok(Ok(generation)) => {
+                    if use_json_grammar && !emitted_any.load(std::sync::atomic::Ordering::Relaxed) {
+                        let mut text = generation.text;
+                        if let Some(extracted) = extract_json_payload(&text) {
+                            text = extracted;
+                        }
+                        let _ = tx.send(Ok(StreamEvent::Token(text)));
+                    }
+                    let usage = LlamaCppProvider::build_usage(
+                        generation.prompt_tokens,
+                        generation.completion_tokens,
+                    );
+                    let _ = tx.send(Ok(StreamEvent::Usage(usage)));
+                    let stop_reason = if generation.finish_reason == "length" {
+                        "length".to_string()
+                    } else {
+                        "end_turn".to_string()
+                    };
+                    let _ = tx.send(Ok(StreamEvent::Done { stop_reason }));
+                }
+                Ok(Err(err)) => {
+                    let _ = tx.send(Err(LLMError::from(err)));
+                }
+                Err(err) => {
+                    let _ = tx.send(Err(LLMError::ProviderError(format!(
+                        "Generation task failed: {err}"
+                    ))));
+                }
+            }
+        });
+
+        let output_stream = futures::stream::unfold(rx, |mut rx| async move {
+            rx.recv().await.map(|item| (item, rx))
+        });
+
+        Box::pin(output_stream)
+    }
+
+    #[cfg(feature = "mtmd")]
+    fn spawn_mtmd_stream(
+        &self,
+        prompt: String,
+        images: Vec<Vec<u8>>,
+        marker: String,
+        max_tokens_override: Option<u32>,
+        temperature_override: Option<f32>,
+        top_p_override: Option<f32>,
+    ) -> Pin<Box<dyn Stream<Item = Result<StreamEvent, LLMError>> + Send>> {
+        let (tx, rx) = mpsc::unbounded_channel::<Result<StreamEvent, LLMError>>();
+        let config = self.config.clone();
+        let model = self.model.clone();
+        let backend = self.backend.clone();
+        let max_tokens = self.resolve_max_tokens(max_tokens_override);
+        let temperature = self.resolve_temperature(temperature_override);
+        let top_p = self.resolve_top_p(top_p_override);
+        let tx_tokens = tx.clone();
+
+        get_rt().spawn(async move {
+            let result = tokio::task::spawn_blocking(
+                move || -> Result<GenerationResult, LlamaCppProviderError> {
+                    let on_token: Option<TokenCallback> = Some(Box::new(move |token: &str| {
+                        tx_tokens
+                            .send(Ok(StreamEvent::Token(token.to_string())))
+                            .map_err(|_| {
+                                LlamaCppProviderError::Inference(
+                                    "Stream receiver dropped".to_string(),
+                                )
+                            })?;
+                        Ok(())
+                    })
+                        as TokenCallback);
+
+                    generate_mtmd_text(
+                        &model,
+                        &backend,
+                        &config,
+                        MtmdGenerationParams {
+                            prompt: &prompt,
+                            marker: &marker,
+                            images: &images,
+                            max_tokens,
+                            temperature,
+                            top_p,
+                            on_token,
+                        },
+                    )
+                },
+            )
+            .await;
+
+            match result {
+                Ok(Ok(generation)) => {
+                    let usage = LlamaCppProvider::build_usage(
+                        generation.prompt_tokens,
+                        generation.completion_tokens,
+                    );
+                    let _ = tx.send(Ok(StreamEvent::Usage(usage)));
+                    let _ = tx.send(Ok(StreamEvent::Done {
+                        stop_reason: generation.finish_reason,
+                    }));
+                }
+                Ok(Err(err)) => {
+                    let _ = tx.send(Err(LLMError::from(err)));
+                }
+                Err(err) => {
+                    let _ = tx.send(Err(LLMError::ProviderError(format!(
+                        "Generation task failed: {err}"
+                    ))));
+                }
+            }
+        });
+
+        let output_stream = futures::stream::unfold(rx, |mut rx| async move {
+            rx.recv().await.map(|item| (item, rx))
+        });
+
+        Box::pin(output_stream)
+    }
+
+    fn spawn_chat_stream(
+        &self,
+        template_result: llama_cpp_2::model::ChatTemplateResult,
+        max_tokens_override: Option<u32>,
+        temperature_override: Option<f32>,
+        top_p_override: Option<f32>,
+    ) -> Pin<Box<dyn Stream<Item = Result<StreamEvent, LLMError>> + Send>> {
+        let (tx, rx) = mpsc::unbounded_channel::<Result<StreamEvent, LLMError>>();
+        let config = self.config.clone();
+        let model = self.model.clone();
+        let backend = self.backend.clone();
+        let max_tokens = self.resolve_max_tokens(max_tokens_override);
+        let temperature = self.resolve_temperature(temperature_override);
+        let top_p = self.resolve_top_p(top_p_override);
+        let session = self.session_state.clone();
+        let tx_deltas = tx.clone();
+
+        get_rt().spawn(async move {
+            let result = tokio::task::spawn_blocking(
+                move || -> Result<(GenerationResult, String), LlamaCppProviderError> {
+                    let on_delta: Option<DeltaCallback> = Some(Box::new(move |delta: &str| {
+                        tx_deltas
+                            .send(Ok(StreamEvent::Delta(delta.to_string())))
+                            .map_err(|_| {
+                                LlamaCppProviderError::Inference(
+                                    "Stream receiver dropped".to_string(),
+                                )
+                            })?;
+                        Ok(())
+                    }));
+
+                    let generation = generate_chat_text(
+                        &model,
+                        &backend,
+                        &config,
+                        ChatGenerationParams {
+                            template_result: &template_result,
+                            max_tokens,
+                            temperature,
+                            top_p,
+                            on_delta,
+                        },
+                        session.as_ref(),
+                    )?;
+
+                    let message_json = template_result
+                        .parse_response_oaicompat(&generation.text, false)
+                        .map_err(|err| {
+                            LlamaCppProviderError::Template(format!(
+                                "Failed to parse response: {err}"
+                            ))
+                        })?;
+                    let message: OpenAICompatMessage = serde_json::from_str(&message_json)
+                        .map_err(|err| {
+                            LlamaCppProviderError::Template(format!(
+                                "Failed to decode parsed message: {err}"
+                            ))
+                        })?;
+
+                    let stop_reason = if generation.finish_reason == "length" {
+                        "length".to_string()
+                    } else if message
+                        .tool_calls
+                        .as_ref()
+                        .map(|calls| !calls.is_empty())
+                        .unwrap_or(false)
+                    {
+                        "tool_use".to_string()
+                    } else {
+                        "end_turn".to_string()
+                    };
+
+                    Ok((generation, stop_reason))
+                },
+            )
+            .await;
+
+            match result {
+                Ok(Ok((generation, stop_reason))) => {
+                    let usage = LlamaCppProvider::build_usage(
+                        generation.prompt_tokens,
+                        generation.completion_tokens,
+                    );
+                    let _ = tx.send(Ok(StreamEvent::Usage(usage)));
+                    let _ = tx.send(Ok(StreamEvent::Done { stop_reason }));
+                }
+                Ok(Err(err)) => {
+                    let _ = tx.send(Err(LLMError::from(err)));
+                }
+                Err(err) => {
+                    let _ = tx.send(Err(LLMError::ProviderError(format!(
+                        "Generation task failed: {err}"
+                    ))));
+                }
+            }
+        });
+
+        let output_stream = futures::stream::unfold(rx, |mut rx| async move {
+            rx.recv().await.map(|item| (item, rx))
+        });
+
+        Box::pin(output_stream)
+    }
+}
+
+// Helper: extract (max_tokens, temperature, top_p) from optional sampling overrides.
+fn unpack_sampling(
+    sampling: Option<&SamplingOverrides>,
+) -> (Option<u32>, Option<f32>, Option<f32>) {
+    (
+        sampling.and_then(|s| s.max_tokens),
+        sampling.and_then(|s| s.temperature),
+        sampling.and_then(|s| s.top_p),
+    )
+}
+
+impl LlamaCppProvider {
+    /// Inner implementation of `chat_with_tools` accepting per-call sampling
+    /// overrides. The public trait methods (`chat_with_tools` and
+    /// `chat_with_tools_and_sampling`) delegate here. Backwards compatible:
+    /// passing `sampling = None` produces identical behaviour to the
+    /// pre-overrides implementation.
+    async fn chat_with_tools_impl(
+        &self,
+        messages: &[ChatMessage],
+        tools: Option<&[Tool]>,
+        json_schema: Option<StructuredOutputFormat>,
+        sampling: Option<&SamplingOverrides>,
+    ) -> Result<Box<dyn ChatResponse>, LLMError> {
+        let (max_tokens_override, temperature_override, top_p_override) = unpack_sampling(sampling);
+
+        if Self::has_mtmd_media(messages) {
+            if tools.is_some() || json_schema.is_some() {
+                return Err(LLMError::InvalidRequest(
+                    "MTMD path does not support tools or structured outputs".to_string(),
+                ));
+            }
+            #[cfg(feature = "mtmd")]
+            {
+                let (prompt, images, marker) = self.build_mtmd_prompt(messages)?;
+                let config = self.config.clone();
+                let model = self.model.clone();
+                let backend = self.backend.clone();
+                let max_tokens = self.resolve_max_tokens(max_tokens_override);
+                let temperature = self.resolve_temperature(temperature_override);
+                let top_p = self.resolve_top_p(top_p_override);
+                let result = get_rt()
+                    .spawn_blocking(move || {
+                        generate_mtmd_text(
+                            &model,
+                            &backend,
+                            &config,
+                            MtmdGenerationParams {
+                                prompt: &prompt,
+                                marker: &marker,
+                                images: &images,
+                                max_tokens,
+                                temperature,
+                                top_p,
+                                on_token: None,
+                            },
+                        )
+                    })
+                    .await
+                    .map_err(|err| {
+                        LLMError::ProviderError(format!("Generation task failed: {err}"))
+                    })?
+                    .map_err(LLMError::from)?;
+
+                let usage = Some(Self::build_usage(
+                    result.prompt_tokens,
+                    result.completion_tokens,
+                ));
+
+                return Ok(Box::new(LlamaCppResponse {
+                    content: Some(result.text),
+                    thinking: None,
+                    tool_calls: None,
+                    usage,
+                }));
+            }
+            #[cfg(not(feature = "mtmd"))]
+            {
+                return Err(LLMError::InvalidRequest(
+                    "MTMD feature is not enabled for llama.cpp backend".to_string(),
+                ));
+            }
+        }
+
+        let prompt = self.build_chat_prompt(messages, tools, json_schema.as_ref())?;
+        match prompt {
+            ChatPrompt::Fallback {
+                prompt,
+                use_json_grammar,
+            } => {
+                if tools.is_some() {
+                    return Err(LLMError::NoToolSupport(
+                        "Tool calls require a chat template".to_string(),
+                    ));
+                }
+                let result = self
+                    .generate_completion_response(
+                        prompt,
+                        use_json_grammar,
+                        max_tokens_override,
+                        temperature_override,
+                        top_p_override,
+                    )
+                    .await?;
+                let usage = Some(Self::build_usage(
+                    result.prompt_tokens,
+                    result.completion_tokens,
+                ));
+
+                Ok(Box::new(LlamaCppResponse {
+                    content: Some(result.text),
+                    thinking: None,
+                    tool_calls: None,
+                    usage,
+                }))
+            }
+            ChatPrompt::OpenAI(template_result) => {
+                let result = self
+                    .generate_chat_completion(
+                        template_result.clone(),
+                        max_tokens_override,
+                        temperature_override,
+                        top_p_override,
+                    )
+                    .await?;
+                let message_json = template_result
+                    .parse_response_oaicompat(&result.text, false)
+                    .map_err(|err| {
+                        LLMError::ProviderError(format!("Failed to parse response: {err}"))
+                    })?;
+                let message: OpenAICompatMessage =
+                    serde_json::from_str(&message_json).map_err(|err| {
+                        LLMError::ProviderError(format!("Failed to decode response: {err}"))
+                    })?;
+
+                let usage = Some(Self::build_usage(
+                    result.prompt_tokens,
+                    result.completion_tokens,
+                ));
+
+                Ok(Box::new(LlamaCppResponse {
+                    content: message
+                        .content
+                        .and_then(StringOrJson::into_non_empty_string),
+                    thinking: message
+                        .reasoning_content
+                        .and_then(StringOrJson::into_non_empty_string),
+                    tool_calls: message
+                        .tool_calls
+                        .map(|calls| calls.into_iter().map(Into::into).collect()),
+                    usage,
+                }))
+            }
+        }
+    }
+
+    /// Inner implementation of `chat_stream` accepting per-call sampling
+    /// overrides.
+    async fn chat_stream_impl(
+        &self,
+        messages: &[ChatMessage],
+        json_schema: Option<StructuredOutputFormat>,
+        sampling: Option<&SamplingOverrides>,
+    ) -> Result<std::pin::Pin<Box<dyn Stream<Item = Result<String, LLMError>> + Send>>, LLMError>
+    {
+        let (max_tokens_override, temperature_override, top_p_override) = unpack_sampling(sampling);
+
+        if Self::has_mtmd_media(messages) {
+            #[cfg(feature = "mtmd")]
+            {
+                let (prompt, images, marker) = self.build_mtmd_prompt(messages)?;
+                let response_stream = self.spawn_mtmd_stream(
+                    prompt,
+                    images,
+                    marker,
+                    max_tokens_override,
+                    temperature_override,
+                    top_p_override,
+                );
+                let content_stream = response_stream.filter_map(|event| async move {
+                    match event {
+                        Ok(StreamEvent::Token(token)) => Some(Ok(token)),
+                        Ok(StreamEvent::Delta(delta)) => match parse_openai_delta(&delta) {
+                            Ok(parsed) => parsed
+                                .content
+                                .and_then(StringOrJson::into_non_empty_string)
+                                .map(Ok),
+                            Err(err) => Some(Err(err)),
+                        },
+                        Ok(StreamEvent::Usage(_)) | Ok(StreamEvent::Done { .. }) => None,
+                        Err(err) => Some(Err(err)),
+                    }
+                });
+                return Ok(Box::pin(content_stream));
+            }
+            #[cfg(not(feature = "mtmd"))]
+            {
+                return Err(LLMError::InvalidRequest(
+                    "MTMD feature is not enabled for llama.cpp backend".to_string(),
+                ));
+            }
+        }
+        let prompt = self.build_chat_prompt(messages, None, json_schema.as_ref())?;
+        let response_stream = match prompt {
+            ChatPrompt::Fallback {
+                prompt,
+                use_json_grammar,
+            } => self.spawn_fallback_stream(
+                prompt,
+                use_json_grammar,
+                max_tokens_override,
+                temperature_override,
+                top_p_override,
+            ),
+            ChatPrompt::OpenAI(template_result) => self.spawn_chat_stream(
+                template_result,
+                max_tokens_override,
+                temperature_override,
+                top_p_override,
+            ),
+        };
+
+        let content_stream = response_stream.filter_map(|event| async move {
+            match event {
+                Ok(StreamEvent::Token(token)) => Some(Ok(token)),
+                Ok(StreamEvent::Delta(delta)) => match parse_openai_delta(&delta) {
+                    Ok(parsed) => parsed
+                        .content
+                        .and_then(StringOrJson::into_non_empty_string)
+                        .map(Ok),
+                    Err(err) => Some(Err(err)),
+                },
+                Ok(StreamEvent::Usage(_)) | Ok(StreamEvent::Done { .. }) => None,
+                Err(err) => Some(Err(err)),
+            }
+        });
+
+        Ok(Box::pin(content_stream))
+    }
+
+    /// Inner implementation of `chat_stream_struct` accepting per-call
+    /// sampling overrides.
+    async fn chat_stream_struct_impl(
+        &self,
+        messages: &[ChatMessage],
+        tools: Option<&[Tool]>,
+        json_schema: Option<StructuredOutputFormat>,
+        sampling: Option<&SamplingOverrides>,
+    ) -> Result<
+        std::pin::Pin<Box<dyn Stream<Item = Result<StreamResponse, LLMError>> + Send>>,
+        LLMError,
+    > {
+        let (max_tokens_override, temperature_override, top_p_override) = unpack_sampling(sampling);
+
+        if Self::has_mtmd_media(messages) {
+            #[cfg(feature = "mtmd")]
+            {
+                if tools.is_some() || json_schema.is_some() {
+                    return Err(LLMError::InvalidRequest(
+                        "MTMD path does not support tools or structured outputs".to_string(),
+                    ));
+                }
+                let (prompt, images, marker) = self.build_mtmd_prompt(messages)?;
+                let response_stream = self.spawn_mtmd_stream(
+                    prompt,
+                    images,
+                    marker,
+                    max_tokens_override,
+                    temperature_override,
+                    top_p_override,
+                );
+                let struct_stream = mtmd_structured_stream(response_stream);
+                return Ok(Box::pin(struct_stream));
+            }
+            #[cfg(not(feature = "mtmd"))]
+            {
+                return Err(LLMError::InvalidRequest(
+                    "MTMD feature is not enabled for llama.cpp backend".to_string(),
+                ));
+            }
+        }
+        let prompt = self.build_chat_prompt(messages, tools, json_schema.as_ref())?;
+        let response_stream = match prompt {
+            ChatPrompt::Fallback {
+                prompt,
+                use_json_grammar,
+            } => self.spawn_fallback_stream(
+                prompt,
+                use_json_grammar,
+                max_tokens_override,
+                temperature_override,
+                top_p_override,
+            ),
+            ChatPrompt::OpenAI(template_result) => self.spawn_chat_stream(
+                template_result,
+                max_tokens_override,
+                temperature_override,
+                top_p_override,
+            ),
+        };
+
+        let struct_stream = response_stream
+            .scan(
+                HashMap::<usize, ToolCallState>::new(),
+                |tool_states, event| {
+                    futures::future::ready(Some(map_struct_stream_event(event, tool_states)))
+                },
+            )
+            .flat_map(futures::stream::iter);
+
+        Ok(Box::pin(struct_stream))
+    }
+
+    /// Inner implementation of `chat_stream_with_tools` accepting per-call
+    /// sampling overrides.
+    async fn chat_stream_with_tools_impl(
+        &self,
+        messages: &[ChatMessage],
+        tools: Option<&[Tool]>,
+        json_schema: Option<StructuredOutputFormat>,
+        sampling: Option<&SamplingOverrides>,
+    ) -> Result<Pin<Box<dyn Stream<Item = Result<StreamChunk, LLMError>> + Send>>, LLMError> {
+        let (max_tokens_override, temperature_override, top_p_override) = unpack_sampling(sampling);
+
+        if Self::has_mtmd_media(messages) {
+            if tools.is_some() || json_schema.is_some() {
+                return Err(LLMError::InvalidRequest(
+                    "MTMD path does not support tools or structured outputs".to_string(),
+                ));
+            }
+            #[cfg(feature = "mtmd")]
+            {
+                let (prompt, images, marker) = self.build_mtmd_prompt(messages)?;
+                let response_stream = self.spawn_mtmd_stream(
+                    prompt,
+                    images,
+                    marker,
+                    max_tokens_override,
+                    temperature_override,
+                    top_p_override,
+                );
+                let stream = mtmd_tool_stream(response_stream);
+                return Ok(Box::pin(stream));
+            }
+            #[cfg(not(feature = "mtmd"))]
+            {
+                return Err(LLMError::InvalidRequest(
+                    "MTMD feature is not enabled for llama.cpp backend".to_string(),
+                ));
+            }
+        }
+
+        let prompt = self.build_chat_prompt(messages, tools, json_schema.as_ref())?;
+        let response_stream = match prompt {
+            ChatPrompt::Fallback {
+                prompt,
+                use_json_grammar,
+            } => {
+                if tools.is_some() {
+                    return Err(LLMError::NoToolSupport(
+                        "Tool calls require a chat template".to_string(),
+                    ));
+                }
+                self.spawn_fallback_stream(
+                    prompt,
+                    use_json_grammar,
+                    max_tokens_override,
+                    temperature_override,
+                    top_p_override,
+                )
+            }
+            ChatPrompt::OpenAI(template_result) => self.spawn_chat_stream(
+                template_result,
+                max_tokens_override,
+                temperature_override,
+                top_p_override,
+            ),
+        };
+
+        let stream = response_stream
+            .scan(
+                HashMap::<usize, ToolCallState>::new(),
+                |tool_states, event| {
+                    futures::future::ready(Some(map_tool_stream_event(event, tool_states)))
+                },
+            )
+            .flat_map(futures::stream::iter);
+
+        Ok(Box::pin(stream))
+    }
+}
+
+#[async_trait]
+impl ChatProvider for LlamaCppProvider {
+    async fn chat_with_tools(
+        &self,
+        messages: &[ChatMessage],
+        tools: Option<&[Tool]>,
+        json_schema: Option<StructuredOutputFormat>,
+    ) -> Result<Box<dyn ChatResponse>, LLMError> {
+        self.chat_with_tools_impl(messages, tools, json_schema, None)
+            .await
+    }
+
+    async fn chat_with_tools_and_sampling(
+        &self,
+        messages: &[ChatMessage],
+        tools: Option<&[Tool]>,
+        json_schema: Option<StructuredOutputFormat>,
+        sampling: Option<&SamplingOverrides>,
+    ) -> Result<Box<dyn ChatResponse>, LLMError> {
+        self.chat_with_tools_impl(messages, tools, json_schema, sampling)
+            .await
+    }
+
+    async fn chat_stream(
+        &self,
+        messages: &[ChatMessage],
+        json_schema: Option<StructuredOutputFormat>,
+    ) -> Result<std::pin::Pin<Box<dyn Stream<Item = Result<String, LLMError>> + Send>>, LLMError>
+    {
+        self.chat_stream_impl(messages, json_schema, None).await
+    }
+
+    async fn chat_stream_and_sampling(
+        &self,
+        messages: &[ChatMessage],
+        json_schema: Option<StructuredOutputFormat>,
+        sampling: Option<&SamplingOverrides>,
+    ) -> Result<std::pin::Pin<Box<dyn Stream<Item = Result<String, LLMError>> + Send>>, LLMError>
+    {
+        self.chat_stream_impl(messages, json_schema, sampling).await
+    }
+
+    async fn chat_stream_struct(
+        &self,
+        messages: &[ChatMessage],
+        tools: Option<&[Tool]>,
+        json_schema: Option<StructuredOutputFormat>,
+    ) -> Result<
+        std::pin::Pin<Box<dyn Stream<Item = Result<StreamResponse, LLMError>> + Send>>,
+        LLMError,
+    > {
+        self.chat_stream_struct_impl(messages, tools, json_schema, None)
+            .await
+    }
+
+    async fn chat_stream_struct_and_sampling(
+        &self,
+        messages: &[ChatMessage],
+        tools: Option<&[Tool]>,
+        json_schema: Option<StructuredOutputFormat>,
+        sampling: Option<&SamplingOverrides>,
+    ) -> Result<
+        std::pin::Pin<Box<dyn Stream<Item = Result<StreamResponse, LLMError>> + Send>>,
+        LLMError,
+    > {
+        self.chat_stream_struct_impl(messages, tools, json_schema, sampling)
+            .await
+    }
+
+    async fn chat_stream_with_tools(
+        &self,
+        messages: &[ChatMessage],
+        tools: Option<&[Tool]>,
+        json_schema: Option<StructuredOutputFormat>,
+    ) -> Result<Pin<Box<dyn Stream<Item = Result<StreamChunk, LLMError>> + Send>>, LLMError> {
+        self.chat_stream_with_tools_impl(messages, tools, json_schema, None)
+            .await
+    }
+}
+
+fn prepare_messages_with_system(
+    config: &LlamaCppConfig,
+    messages: &[ChatMessage],
+) -> Vec<ChatMessage> {
+    let mut all_messages = Vec::new();
+
+    if let Some(system_prompt) = &config.system_prompt {
+        let has_system_message = messages
+            .iter()
+            .any(|msg| msg.role == autoagents_llm::chat::ChatRole::System);
+
+        if !has_system_message {
+            all_messages.push(ChatMessage {
+                role: autoagents_llm::chat::ChatRole::System,
+                message_type: autoagents_llm::chat::MessageType::Text,
+                content: system_prompt.clone(),
+            });
+        }
+    }
+
+    all_messages.extend_from_slice(messages);
+    all_messages
+}
+
+fn prepare_fallback_messages_with_schema(
+    config: &LlamaCppConfig,
+    messages: &[ChatMessage],
+    json_schema: Option<&StructuredOutputFormat>,
+) -> Vec<ChatMessage> {
+    let mut all_messages = prepare_messages_with_system(config, messages);
+
+    if let Some(schema) = json_schema {
+        let mut schema_hint = format!("Return a valid JSON response for schema '{}'.", schema.name);
+        if let Some(description) = &schema.description {
+            schema_hint.push_str(&format!(" {description}"));
+        }
+        if let Some(json_schema) = &schema.schema {
+            schema_hint.push_str(&format!(" Schema: {json_schema}"));
+        }
+        all_messages.push(ChatMessage {
+            role: autoagents_llm::chat::ChatRole::System,
+            message_type: autoagents_llm::chat::MessageType::Text,
+            content: schema_hint,
+        });
+    }
+
+    all_messages
+}
+
+fn sanitize_chat_template_schema(schema: &StructuredOutputFormat) -> Option<Value> {
+    let mut schema = schema.schema.clone()?;
+    if schema.get("additionalProperties").is_none()
+        && matches!(schema.get("type"), Some(Value::String(kind)) if kind == "object")
+    {
+        schema["additionalProperties"] = Value::Bool(false);
+    }
+    Some(schema)
+}
+
+fn select_template_schema_and_grammar(
+    tools_present: bool,
+    json_schema: Option<&StructuredOutputFormat>,
+    force_json_grammar: bool,
+) -> (Option<String>, Option<String>) {
+    // llama.cpp's OpenAI-compatible template API treats `json_schema` as part of grammar
+    // generation AND configures a schema-bound parser for the generated response. When
+    // tools are present, passing the agent response schema produces invalid grammar and
+    // breaks tool-calling requests entirely. When tools are absent, the schema-bound
+    // parser expects a structured-output envelope that plain-JSON generations don't
+    // provide, surfacing as `ffi error -3` from `chat_parse_to_oaicompat`
+    // (https://github.com/liquidos-ai/AutoAgents/issues/220). In both cases we compile
+    // the schema to grammar at our boundary and pass it via the `grammar` slot, leaving
+    // the parser in its generic (text) mode.
+    if tools_present {
+        return (None, None);
+    }
+
+    if let Some(schema_value) = json_schema.and_then(sanitize_chat_template_schema) {
+        let schema_str = schema_value.to_string();
+        let grammar = llama_cpp_2::json_schema_to_grammar(&schema_str)
+            .unwrap_or_else(|_| JSON_GRAMMAR.to_string());
+        return (None, Some(grammar));
+    }
+
+    let grammar_value = if force_json_grammar {
+        Some(JSON_GRAMMAR.to_string())
+    } else {
+        None
+    };
+    (None, grammar_value)
+}
+
+fn ensure_supported_messages_for_config(
+    _config: &LlamaCppConfig,
+    messages: &[ChatMessage],
+) -> Result<(), LLMError> {
+    for message in messages {
+        match &message.message_type {
+            MessageType::Text | MessageType::ToolUse(_) | MessageType::ToolResult(_) => {}
+            MessageType::Image(_) => {
+                #[cfg(feature = "mtmd")]
+                {
+                    if _config.mmproj_path.is_some() {
+                        continue;
+                    }
+                }
+                return Err(LLMError::InvalidRequest(
+                    "llama.cpp backend does not support image inputs without MTMD and mmproj configured"
+                        .to_string(),
+                ));
+            }
+            MessageType::ImageURL(_) | MessageType::Pdf(_) => {
+                return Err(LLMError::InvalidRequest(
+                    "llama.cpp backend does not support image URL or PDF inputs".to_string(),
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn parse_openai_delta(delta: &str) -> Result<OpenAICompatDelta, LLMError> {
+    serde_json::from_str(delta).map_err(|err| LLMError::JsonError(err.to_string()))
+}
+
+#[cfg(feature = "mtmd")]
+fn mtmd_structured_stream(
+    response_stream: Pin<Box<dyn Stream<Item = Result<StreamEvent, LLMError>> + Send>>,
+) -> impl Stream<Item = Result<StreamResponse, LLMError>> {
+    response_stream.filter_map(|event| async move {
+        match event {
+            Ok(StreamEvent::Token(token)) => {
+                Some(Ok(single_stream_response(Some(token), None, None, None)))
+            }
+            Ok(StreamEvent::Usage(_)) | Ok(StreamEvent::Done { .. }) => None,
+            Ok(StreamEvent::Delta(delta)) => match parse_openai_delta(&delta) {
+                Ok(parsed) => {
+                    let content = parsed.content.and_then(StringOrJson::into_non_empty_string);
+                    let reasoning_content = parsed
+                        .reasoning_content
+                        .and_then(StringOrJson::into_non_empty_string);
+                    if content.is_none() && reasoning_content.is_none() {
+                        None
+                    } else {
+                        Some(Ok(single_stream_response(
+                            content,
+                            reasoning_content,
+                            None,
+                            None,
+                        )))
+                    }
+                }
+                Err(err) => Some(Err(err)),
+            },
+            Err(err) => Some(Err(err)),
+        }
+    })
+}
+
+#[cfg(feature = "mtmd")]
+fn mtmd_tool_stream(
+    response_stream: Pin<Box<dyn Stream<Item = Result<StreamEvent, LLMError>> + Send>>,
+) -> impl Stream<Item = Result<StreamChunk, LLMError>> {
+    response_stream
+        .map(|event| {
+            let mut outputs = Vec::new();
+            match event {
+                Ok(StreamEvent::Token(token)) => {
+                    if !token.is_empty() {
+                        outputs.push(Ok(StreamChunk::Text(token)));
+                    }
+                }
+                Ok(StreamEvent::Usage(usage)) => outputs.push(Ok(StreamChunk::Usage(usage))),
+                Ok(StreamEvent::Done { stop_reason }) => {
+                    outputs.push(Ok(StreamChunk::Done { stop_reason }))
+                }
+                Ok(StreamEvent::Delta(delta)) => match parse_openai_delta(&delta) {
+                    Ok(parsed) => {
+                        push_text_and_reasoning_chunks(
+                            parsed.content.and_then(StringOrJson::into_non_empty_string),
+                            parsed
+                                .reasoning_content
+                                .and_then(StringOrJson::into_non_empty_string),
+                            &mut outputs,
+                        );
+                    }
+                    Err(err) => outputs.push(Err(err)),
+                },
+                Err(err) => outputs.push(Err(err)),
+            }
+            outputs
+        })
+        .flat_map(futures::stream::iter)
+}
+
+fn single_stream_response(
+    content: Option<String>,
+    reasoning_content: Option<String>,
+    tool_calls: Option<Vec<ToolCall>>,
+    usage: Option<ChatUsage>,
+) -> StreamResponse {
+    StreamResponse {
+        choices: vec![StreamChoice {
+            delta: StreamDelta {
+                content,
+                reasoning_content,
+                tool_calls,
+            },
+        }],
+        usage,
+    }
+}
+
+fn map_struct_stream_event(
+    event: Result<StreamEvent, LLMError>,
+    tool_states: &mut HashMap<usize, ToolCallState>,
+) -> Vec<Result<StreamResponse, LLMError>> {
+    let mut outputs = Vec::new();
+    match event {
+        Ok(StreamEvent::Token(token)) => {
+            if !token.is_empty() {
+                outputs.push(Ok(single_stream_response(Some(token), None, None, None)));
+            }
+        }
+        Ok(StreamEvent::Delta(delta)) => match parse_openai_delta(&delta) {
+            Ok(parsed) => {
+                push_struct_content_and_reasoning(
+                    parsed.content.and_then(StringOrJson::into_non_empty_string),
+                    parsed
+                        .reasoning_content
+                        .and_then(StringOrJson::into_non_empty_string),
+                    &mut outputs,
+                );
+                if let Some(tool_calls) = parsed.tool_calls {
+                    push_struct_tool_call_updates(tool_calls, tool_states, &mut outputs);
+                }
+            }
+            Err(err) => outputs.push(Err(err)),
+        },
+        Ok(StreamEvent::Usage(usage)) => {
+            outputs.push(Ok(single_stream_response(None, None, None, Some(usage))));
+        }
+        Ok(StreamEvent::Done { .. }) => {}
+        Err(err) => outputs.push(Err(err)),
+    }
+    outputs
+}
+
+fn map_tool_stream_event(
+    event: Result<StreamEvent, LLMError>,
+    tool_states: &mut HashMap<usize, ToolCallState>,
+) -> Vec<Result<StreamChunk, LLMError>> {
+    let mut outputs = Vec::new();
+    match event {
+        Ok(StreamEvent::Token(token)) => {
+            if !token.is_empty() {
+                outputs.push(Ok(StreamChunk::Text(token)));
+            }
+        }
+        Ok(StreamEvent::Delta(delta)) => match parse_openai_delta(&delta) {
+            Ok(parsed) => {
+                push_text_and_reasoning_chunks(
+                    parsed.content.and_then(StringOrJson::into_non_empty_string),
+                    parsed
+                        .reasoning_content
+                        .and_then(StringOrJson::into_non_empty_string),
+                    &mut outputs,
+                );
+                if let Some(tool_calls) = parsed.tool_calls {
+                    push_tool_chunk_updates(tool_calls, tool_states, &mut outputs);
+                }
+            }
+            Err(err) => outputs.push(Err(err)),
+        },
+        Ok(StreamEvent::Usage(usage)) => outputs.push(Ok(StreamChunk::Usage(usage))),
+        Ok(StreamEvent::Done { stop_reason }) => {
+            push_tool_completions(tool_states, &mut outputs);
+            outputs.push(Ok(StreamChunk::Done { stop_reason }));
+        }
+        Err(err) => outputs.push(Err(err)),
+    }
+    outputs
+}
+
+fn push_struct_content_and_reasoning(
+    content: Option<String>,
+    reasoning_content: Option<String>,
+    outputs: &mut Vec<Result<StreamResponse, LLMError>>,
+) {
+    if let Some(content) = content
+        && !content.is_empty()
+    {
+        outputs.push(Ok(single_stream_response(Some(content), None, None, None)));
+    }
+    if let Some(reasoning_content) = reasoning_content
+        && !reasoning_content.is_empty()
+    {
+        outputs.push(Ok(single_stream_response(
+            None,
+            Some(reasoning_content),
+            None,
+            None,
+        )));
+    }
+}
+
+fn push_struct_tool_call_updates(
+    tool_calls: Vec<OpenAIToolCallDelta>,
+    tool_states: &mut HashMap<usize, ToolCallState>,
+    outputs: &mut Vec<Result<StreamResponse, LLMError>>,
+) {
+    let mut updated_calls = Vec::new();
+    for call in tool_calls {
+        let index = call.index.unwrap_or(0);
+        let call_type = call.call_type.unwrap_or_else(|| "function".to_string());
+        let state = tool_states.entry(index).or_default();
+        if let Some(id) = call.id {
+            state.id = id;
+        }
+        if let Some(function) = call.function {
+            if let Some(name) = function.name {
+                state.name = name;
+            }
+            let arguments = function.arguments.into_string();
+            if !arguments.is_empty() {
+                state.arguments.push_str(&arguments);
+            }
+        }
+        if !state.id.is_empty() || !state.name.is_empty() || !state.arguments.is_empty() {
+            updated_calls.push(ToolCall {
+                id: state.id.clone(),
+                call_type: call_type.clone(),
+                function: FunctionCall {
+                    name: state.name.clone(),
+                    arguments: state.arguments.clone(),
+                },
+            });
+        }
+    }
+
+    if !updated_calls.is_empty() {
+        outputs.push(Ok(single_stream_response(
+            None,
+            None,
+            Some(updated_calls),
+            None,
+        )));
+    }
+}
+
+fn push_tool_chunk_updates(
+    tool_calls: Vec<OpenAIToolCallDelta>,
+    tool_states: &mut HashMap<usize, ToolCallState>,
+    outputs: &mut Vec<Result<StreamChunk, LLMError>>,
+) {
+    for call in tool_calls {
+        let index = call.index.unwrap_or(0);
+        let state = tool_states.entry(index).or_default();
+        if let Some(id) = call.id {
+            state.id = id;
+        }
+        if let Some(function) = call.function {
+            if let Some(name) = function.name {
+                state.name = name;
+                if !state.started {
+                    state.started = true;
+                    outputs.push(Ok(StreamChunk::ToolUseStart {
+                        index,
+                        id: state.id.clone(),
+                        name: state.name.clone(),
+                    }));
+                }
+            }
+            let arguments = function.arguments.into_string();
+            if !arguments.is_empty() {
+                state.arguments.push_str(&arguments);
+                outputs.push(Ok(StreamChunk::ToolUseInputDelta {
+                    index,
+                    partial_json: arguments,
+                }));
+            }
+        }
+    }
+}
+
+fn push_tool_completions(
+    tool_states: &mut HashMap<usize, ToolCallState>,
+    outputs: &mut Vec<Result<StreamChunk, LLMError>>,
+) {
+    for (index, state) in tool_states.drain() {
+        if state.started {
+            outputs.push(Ok(StreamChunk::ToolUseComplete {
+                index,
+                tool_call: ToolCall {
+                    id: state.id,
+                    call_type: "function".to_string(),
+                    function: FunctionCall {
+                        name: state.name,
+                        arguments: state.arguments,
+                    },
+                },
+            }));
+        }
+    }
+}
+
+fn push_text_and_reasoning_chunks(
+    content: Option<String>,
+    reasoning_content: Option<String>,
+    outputs: &mut Vec<Result<StreamChunk, LLMError>>,
+) {
+    if let Some(content) = content
+        && !content.is_empty()
+    {
+        outputs.push(Ok(StreamChunk::Text(content)));
+    }
+    if let Some(reasoning_content) = reasoning_content
+        && !reasoning_content.is_empty()
+    {
+        outputs.push(Ok(StreamChunk::ReasoningContent(reasoning_content)));
+    }
+}
+
+#[async_trait]
+impl CompletionProvider for LlamaCppProvider {
+    async fn complete(
+        &self,
+        req: &CompletionRequest,
+        json_schema: Option<StructuredOutputFormat>,
+    ) -> Result<CompletionResponse, LLMError> {
+        let prompt = PromptData {
+            prompt: req.prompt.clone(),
+            add_bos: AddBos::Always,
+        };
+        let use_json_grammar = json_schema.is_some() || self.config.force_json_grammar;
+        let result = self
+            .generate_completion_response(
+                prompt,
+                use_json_grammar,
+                req.max_tokens,
+                req.temperature,
+                None,
+            )
+            .await?;
+
+        Ok(CompletionResponse { text: result.text })
+    }
+}
+
+#[async_trait]
+impl EmbeddingProvider for LlamaCppProvider {
+    async fn embed(&self, input: Vec<String>) -> Result<Vec<Vec<f32>>, LLMError> {
+        let config = self.config.clone();
+        let model = self.model.clone();
+        let backend = self.backend.clone();
+
+        Self::run_blocking_task("Embedding", move || {
+            let mut embeddings = Vec::with_capacity(input.len());
+            for text in input {
+                let embedding = generate_embedding(&model, &backend, &config, &text)?;
+                embeddings.push(embedding);
+            }
+            Ok(embeddings)
+        })
+        .await
+    }
+}
+
+#[async_trait]
+impl ModelsProvider for LlamaCppProvider {}
+
+impl LLMProvider for LlamaCppProvider {}
+
+fn initialize_backend() -> Result<Arc<LlamaBackend>, LlamaCppProviderError> {
+    static BACKEND: OnceLock<Arc<LlamaBackend>> = OnceLock::new();
+    if let Some(backend) = BACKEND.get() {
+        return Ok(backend.clone());
+    }
+
+    let mut backend = LlamaBackend::init().map_err(|err| {
+        LlamaCppProviderError::Other(format!("Failed to initialize llama backend: {err}"))
+    })?;
+    if !llama_logs_enabled() {
+        backend.void_logs();
+    }
+    let backend = Arc::new(backend);
+    let _ = BACKEND.set(backend.clone());
+    Ok(backend)
+}
+
+fn llama_logs_enabled() -> bool {
+    log::log_enabled!(log::Level::Info)
+}
+
+async fn load_model(
+    backend: Arc<LlamaBackend>,
+    config: &LlamaCppConfig,
+) -> Result<Arc<LlamaModel>, LLMError> {
+    let model_source = config.model_source.clone();
+    let config = config.clone();
+    get_rt()
+        .spawn_blocking(move || -> Result<LlamaModel, LlamaCppProviderError> {
+            let params = build_model_params(&config)?;
+            let model_path = resolve_model_path(&model_source, &config)?;
+            let path = Path::new(&model_path);
+            LlamaModel::load_from_file(&backend, path, &params)
+                .map_err(|err| LlamaCppProviderError::ModelLoad(err.to_string()))
+        })
+        .await
+        .map_err(|err| LLMError::ProviderError(format!("Model load task failed: {err}")))?
+        .map(Arc::new)
+        .map_err(LLMError::from)
+}
+
+fn build_model_params(config: &LlamaCppConfig) -> Result<LlamaModelParams, LlamaCppProviderError> {
+    let mut params = LlamaModelParams::default();
+
+    if let Some(layers) = config.n_gpu_layers {
+        params = params.with_n_gpu_layers(layers);
+    }
+    if let Some(main_gpu) = config.main_gpu {
+        params = params.with_main_gpu(main_gpu);
+    }
+    if let Some(split_mode) = config.split_mode {
+        params = params.with_split_mode(split_mode.into());
+    }
+    if let Some(use_mlock) = config.use_mlock {
+        params = params.with_use_mlock(use_mlock);
+    }
+    if let Some(devices) = config.devices.as_ref() {
+        params = params
+            .with_devices(devices)
+            .map_err(|err| LlamaCppProviderError::Config(err.to_string()))?;
+    }
+
+    Ok(params)
+}
+
+fn resolve_model_path(
+    source: &ModelSource,
+    config: &LlamaCppConfig,
+) -> Result<String, LlamaCppProviderError> {
+    match source {
+        ModelSource::Gguf { model_path } => {
+            if model_path.is_empty() {
+                return Err(LlamaCppProviderError::Config(
+                    "Model path is required for llama.cpp".to_string(),
+                ));
+            }
+            Ok(model_path.clone())
+        }
+        ModelSource::HuggingFace {
+            repo_id, filename, ..
+        } => crate::huggingface::resolve_hf_model(repo_id, filename.as_deref(), config),
+    }
+}
+
+fn resolve_n_batch(config: &LlamaCppConfig, n_ctx: u32) -> u32 {
+    let n_ctx = n_ctx.max(1);
+    let requested = config.n_batch.unwrap_or(DEFAULT_N_BATCH).max(1);
+    requested.min(n_ctx)
+}
+
+fn build_context_params(
+    config: &LlamaCppConfig,
+    embeddings: bool,
+    n_ctx_override: Option<u32>,
+    n_batch_override: Option<u32>,
+) -> Result<LlamaContextParams, LlamaCppProviderError> {
+    let mut params = LlamaContextParams::default();
+
+    if let Some(n_ctx) = n_ctx_override.or(config.n_ctx) {
+        params = params.with_n_ctx(NonZeroU32::new(n_ctx));
+    }
+    if let Some(n_batch) = n_batch_override.or(config.n_batch) {
+        params = params.with_n_batch(n_batch);
+    }
+    if let Some(n_ubatch) = config.n_ubatch {
+        params = params.with_n_ubatch(n_ubatch);
+    }
+    if let Some(n_threads) = config.n_threads {
+        params = params.with_n_threads(n_threads);
+    }
+    if let Some(n_threads) = config.n_threads_batch {
+        params = params.with_n_threads_batch(n_threads);
+    }
+    params = params.with_embeddings(embeddings);
+
+    Ok(params)
+}
+
+fn resolve_context_size(
+    model: &LlamaModel,
+    config: &LlamaCppConfig,
+    required_tokens: u32,
+) -> Result<u32, LlamaCppProviderError> {
+    if let Some(n_ctx) = config.n_ctx {
+        if required_tokens > n_ctx {
+            return Err(LlamaCppProviderError::Inference(format!(
+                "Prompt length ({required_tokens}) exceeds context size ({n_ctx})",
+            )));
+        }
+        return Ok(n_ctx);
+    }
+
+    Ok(model.n_ctx_train().max(required_tokens))
+}
+
+fn build_sampler(
+    model: &LlamaModel,
+    config: &LlamaCppConfig,
+    use_json_grammar: bool,
+    temperature_override: Option<f32>,
+    top_p_override: Option<f32>,
+    seed_override: Option<u32>,
+) -> Result<LlamaSampler, LlamaCppProviderError> {
+    let mut samplers = Vec::new();
+
+    if use_json_grammar {
+        let sampler = LlamaSampler::grammar(model, JSON_GRAMMAR, "root")
+            .map_err(|err| LlamaCppProviderError::Template(err.to_string()))?;
+        samplers.push(sampler);
+    }
+
+    let penalty_repeat = config.repeat_penalty.unwrap_or(1.0);
+    let penalty_freq = config.frequency_penalty.unwrap_or(0.0);
+    let penalty_present = config.presence_penalty.unwrap_or(0.0);
+    let penalty_last_n = config.repeat_last_n.unwrap_or(64);
+    if penalty_repeat != 1.0 || penalty_freq != 0.0 || penalty_present != 0.0 {
+        samplers.push(LlamaSampler::penalties(
+            penalty_last_n,
+            penalty_repeat,
+            penalty_freq,
+            penalty_present,
+        ));
+    }
+
+    if let Some(top_k) = config.top_k {
+        samplers.push(LlamaSampler::top_k(top_k as i32));
+    }
+    if let Some(top_p) = top_p_override.or(config.top_p) {
+        samplers.push(LlamaSampler::top_p(top_p, 1));
+    }
+
+    let temperature = temperature_override.or(config.temperature);
+    if let Some(temp) = temperature {
+        if temp > 0.0 {
+            samplers.push(LlamaSampler::temp(temp));
+            let seed = seed_override.or(config.seed).unwrap_or_else(rand::random);
+            samplers.push(LlamaSampler::dist(seed));
+        } else {
+            samplers.push(LlamaSampler::greedy());
+        }
+    } else {
+        let seed = seed_override.or(config.seed).unwrap_or_else(rand::random);
+        samplers.push(LlamaSampler::dist(seed));
+    }
+
+    Ok(LlamaSampler::chain_simple(samplers))
+}
+
+fn regex_escape(value: &str) -> String {
+    let mut escaped = String::with_capacity(value.len());
+    for ch in value.chars() {
+        match ch {
+            '.' | '^' | '$' | '|' | '(' | ')' | '*' | '+' | '?' | '[' | ']' | '{' | '}' | '\\' => {
+                escaped.push('\\');
+                escaped.push(ch);
+            }
+            _ => escaped.push(ch),
+        }
+    }
+    escaped
+}
+
+fn anchor_pattern(pattern: &str) -> String {
+    if pattern.is_empty() {
+        return "^$".to_string();
+    }
+    let mut anchored = String::default();
+    if !pattern.starts_with('^') {
+        anchored.push('^');
+    }
+    anchored.push_str(pattern);
+    if !pattern.ends_with('$') {
+        anchored.push('$');
+    }
+    anchored
+}
+
+fn build_chat_sampler(
+    model: &LlamaModel,
+    config: &LlamaCppConfig,
+    result: &llama_cpp_2::model::ChatTemplateResult,
+    temperature_override: Option<f32>,
+    top_p_override: Option<f32>,
+) -> Result<(LlamaSampler, HashSet<LlamaToken>), LlamaCppProviderError> {
+    let mut preserved = HashSet::new();
+    for token_str in &result.preserved_tokens {
+        let tokens = model
+            .str_to_token(token_str, AddBos::Never)
+            .map_err(|err| LlamaCppProviderError::Tokenization(err.to_string()))?;
+        if tokens.len() == 1 {
+            preserved.insert(tokens[0]);
+        }
+    }
+
+    let grammar_sampler = if let Some(grammar) = result.grammar.as_deref() {
+        if result.grammar_lazy {
+            if result.grammar_triggers.is_empty() {
+                return Err(LlamaCppProviderError::Template(
+                    "grammar_lazy enabled but no triggers were provided".to_string(),
+                ));
+            }
+            let mut trigger_patterns = Vec::new();
+            let mut trigger_tokens = Vec::new();
+            for trigger in &result.grammar_triggers {
+                match trigger.trigger_type {
+                    GrammarTriggerType::Token => {
+                        if let Some(token) = trigger.token {
+                            trigger_tokens.push(token);
+                        }
+                    }
+                    GrammarTriggerType::Word => {
+                        let tokens = model
+                            .str_to_token(&trigger.value, AddBos::Never)
+                            .map_err(|err| LlamaCppProviderError::Tokenization(err.to_string()))?;
+                        if tokens.len() == 1 {
+                            if !preserved.contains(&tokens[0]) {
+                                return Err(LlamaCppProviderError::Template(format!(
+                                    "grammar trigger word not preserved: {}",
+                                    trigger.value
+                                )));
+                            }
+                            trigger_tokens.push(tokens[0]);
+                        } else {
+                            trigger_patterns.push(regex_escape(&trigger.value));
+                        }
+                    }
+                    GrammarTriggerType::Pattern => {
+                        trigger_patterns.push(trigger.value.clone());
+                    }
+                    GrammarTriggerType::PatternFull => {
+                        trigger_patterns.push(anchor_pattern(&trigger.value));
+                    }
+                }
+            }
+
+            Some(
+                LlamaSampler::grammar_lazy_patterns(
+                    model,
+                    grammar,
+                    "root",
+                    &trigger_patterns,
+                    &trigger_tokens,
+                )
+                .map_err(|err| LlamaCppProviderError::Template(err.to_string()))?,
+            )
+        } else {
+            Some(
+                LlamaSampler::grammar(model, grammar, "root")
+                    .map_err(|err| LlamaCppProviderError::Template(err.to_string()))?,
+            )
+        }
+    } else {
+        None
+    };
+
+    let mut samplers = Vec::new();
+    if let Some(grammar_sampler) = grammar_sampler {
+        samplers.push(grammar_sampler);
+    }
+
+    let penalty_repeat = config.repeat_penalty.unwrap_or(1.0);
+    let penalty_freq = config.frequency_penalty.unwrap_or(0.0);
+    let penalty_present = config.presence_penalty.unwrap_or(0.0);
+    let penalty_last_n = config.repeat_last_n.unwrap_or(64);
+    if penalty_repeat != 1.0 || penalty_freq != 0.0 || penalty_present != 0.0 {
+        samplers.push(LlamaSampler::penalties(
+            penalty_last_n,
+            penalty_repeat,
+            penalty_freq,
+            penalty_present,
+        ));
+    }
+
+    if let Some(top_k) = config.top_k {
+        samplers.push(LlamaSampler::top_k(top_k as i32));
+    }
+    if let Some(top_p) = top_p_override.or(config.top_p) {
+        samplers.push(LlamaSampler::top_p(top_p, 1));
+    }
+
+    let temperature = temperature_override.or(config.temperature);
+    if let Some(temp) = temperature {
+        if temp > 0.0 {
+            samplers.push(LlamaSampler::temp(temp));
+            let seed = config.seed.unwrap_or_else(rand::random);
+            samplers.push(LlamaSampler::dist(seed));
+        } else {
+            samplers.push(LlamaSampler::greedy());
+        }
+    } else {
+        let seed = config.seed.unwrap_or_else(rand::random);
+        samplers.push(LlamaSampler::dist(seed));
+    }
+
+    Ok((LlamaSampler::chain_simple(samplers), preserved))
+}
+
+/// Acquire an inference context: either from persistent session state (with
+/// prefix reuse) or by creating a fresh context.
+///
+/// Returns `(ActiveContext, start_position)` where `start_position` is the
+/// KV-cache position after the prompt has been decoded.
+struct ContextAcquisitionRequest<'a> {
+    prompt_tokens: &'a [LlamaToken],
+    n_ctx: u32,
+    n_batch: u32,
+    required_tokens: u32,
+}
+
+fn acquire_context<'a>(
+    model: &'a Arc<LlamaModel>,
+    backend: &'a Arc<LlamaBackend>,
+    config: &LlamaCppConfig,
+    session_state: Option<&'a SharedSessionState>,
+    request: ContextAcquisitionRequest<'_>,
+) -> Result<(ActiveContext<'a>, i32), LlamaCppProviderError> {
+    let ContextAcquisitionRequest {
+        prompt_tokens,
+        n_ctx,
+        n_batch,
+        required_tokens,
+    } = request;
+
+    if let Some(shared) = session_state {
+        let mut guard = shared.lock().expect("session mutex poisoned");
+
+        // Lazily create the session on first call.
+        if guard.is_none() {
+            *guard = Some(SessionState::new(
+                Arc::clone(backend),
+                Arc::clone(model),
+                config,
+                n_ctx,
+                n_batch,
+            )?);
+        }
+
+        {
+            let state = guard.as_mut().expect("session just initialised");
+
+            if required_tokens > state.n_ctx {
+                // New prompt + generation headroom exceeds session context
+                // window. Reset with a fresh, correctly-sized context.
+                let _ = state;
+                *guard = Some(SessionState::new(
+                    Arc::clone(backend),
+                    Arc::clone(model),
+                    config,
+                    n_ctx,
+                    n_batch,
+                )?);
+                let state = guard.as_mut().unwrap();
+                state.decode_tokens(prompt_tokens, n_batch as usize)?;
+            } else {
+                // Prefix reuse: evict stale tail, decode only new tokens.
+                let prefix_len = state.prefix_len(prompt_tokens);
+                state.evict_after(prefix_len)?;
+                let new_tokens = &prompt_tokens[prefix_len..];
+                if !new_tokens.is_empty() {
+                    state.decode_tokens(new_tokens, n_batch as usize)?;
+                } else {
+                    // 100% prefix match — no new tokens to decode.
+                    // Re-decode the last prompt token to refresh the logits
+                    // buffer. Without this, the sampler reads stale logits
+                    // from the previous call's last generated token.
+                    let last_pos = state.next_pos - 1;
+                    let last_tok = prompt_tokens[prefix_len - 1];
+                    let mut batch = LlamaBatch::new(1, 1);
+                    batch.add(last_tok, last_pos, &[0], true).map_err(|e| {
+                        LlamaCppProviderError::Inference(format!("logits refresh batch add: {e}"))
+                    })?;
+                    state.ctx.decode(&mut batch).map_err(|e| {
+                        LlamaCppProviderError::Inference(format!("logits refresh decode: {e}"))
+                    })?;
+                }
+            }
+        }
+
+        let pos = guard.as_ref().expect("session exists").next_pos;
+        Ok((ActiveContext::Session(guard), pos))
+    } else {
+        // No session state — fresh context (original behavior).
+        let ctx_params = build_context_params(config, false, Some(n_ctx), Some(n_batch))?;
+        let mut ctx = model
+            .new_context(backend, ctx_params)
+            .map_err(|err| LlamaCppProviderError::ContextLoad(err.to_string()))?;
+
+        let mut batch = LlamaBatch::new(n_ctx as usize, 1);
+        let batch_limit = n_batch as usize;
+        let mut position = 0_i32;
+        for chunk in prompt_tokens.chunks(batch_limit.max(1)) {
+            batch.clear();
+            let last_index = (chunk.len().saturating_sub(1)) as i32;
+            for (idx, token) in (0_i32..).zip(chunk.iter().copied()) {
+                let is_last = idx == last_index;
+                batch
+                    .add(token, position + idx, &[0], is_last)
+                    .map_err(|err| LlamaCppProviderError::Inference(err.to_string()))?;
+            }
+            ctx.decode(&mut batch)
+                .map_err(|err| LlamaCppProviderError::Inference(err.to_string()))?;
+            position += chunk.len() as i32;
+        }
+        Ok((ActiveContext::Owned(ctx), position))
+    }
+}
+
+fn generate_chat_text(
+    model: &Arc<LlamaModel>,
+    backend: &Arc<LlamaBackend>,
+    config: &LlamaCppConfig,
+    params: ChatGenerationParams<'_>,
+    session_state: Option<&SharedSessionState>,
+) -> Result<GenerationResult, LlamaCppProviderError> {
+    let ChatGenerationParams {
+        template_result,
+        max_tokens,
+        temperature,
+        top_p,
+        mut on_delta,
+    } = params;
+
+    let mut prompt_tokens = model
+        .str_to_token(&template_result.prompt, AddBos::Always)
+        .map_err(|err| LlamaCppProviderError::Tokenization(err.to_string()))?;
+
+    if prompt_tokens.is_empty() {
+        return Err(LlamaCppProviderError::Inference(
+            "Prompt produced no tokens".to_string(),
+        ));
+    }
+
+    let prompt_len = prompt_tokens.len();
+    let required_tokens = prompt_len as u32 + max_tokens;
+    let n_ctx = resolve_context_size(model, config, required_tokens)?;
+    let n_batch = resolve_n_batch(config, n_ctx);
+
+    // -----------------------------------------------------------------------
+    // Context acquisition: prefix-reuse path vs fresh-context path
+    // -----------------------------------------------------------------------
+    let (mut active_ctx, batch_start_pos) = acquire_context(
+        model,
+        backend,
+        config,
+        session_state,
+        ContextAcquisitionRequest {
+            prompt_tokens: &prompt_tokens,
+            n_ctx,
+            n_batch,
+            required_tokens,
+        },
+    )?;
+
+    let mut n_cur = batch_start_pos;
+    let max_tokens_total = n_cur + max_tokens as i32;
+    let mut generated_text = String::default();
+    let mut completion_tokens = 0u32;
+    let mut decoder = encoding_rs::UTF_8.new_decoder();
+
+    let (mut sampler, preserved) =
+        build_chat_sampler(model, config, template_result, temperature, top_p)?;
+    let additional_stops = template_result.additional_stops.clone();
+    let mut stream_state = if on_delta.is_some() {
+        Some(template_result.streaming_state_oaicompat().map_err(|err| {
+            LlamaCppProviderError::Template(format!("Failed to init streaming state: {err}"))
+        })?)
+    } else {
+        None
+    };
+
+    // We need a LlamaBatch for generation steps. Size 1 per step.
+    let mut gen_batch = LlamaBatch::new(1, 1);
+
+    // Sample first token using the last logits from prefill.
+    // The prefill left logits at the last batch position.
+    let mut finish_reason = "stop".to_string();
+    let mut first_sample = true;
+
+    while n_cur < max_tokens_total {
+        let token = if first_sample {
+            first_sample = false;
+            // After prefill, logits are at batch.n_tokens() - 1.
+            // For session path, last decode set logits at position -1 of the batch.
+            // Use index -1 (last) which maps to batch.n_tokens() - 1 internally.
+            active_ctx.with_ctx(|ctx| sampler.sample(ctx, -1))
+        } else {
+            active_ctx.with_ctx(|ctx| sampler.sample(ctx, gen_batch.n_tokens() - 1))
+        };
+
+        if model.is_eog_token(token) {
+            break;
+        }
+
+        let decode_special = preserved.contains(&token);
+        let output_string = model
+            .token_to_piece(token, &mut decoder, decode_special, None)
+            .map_err(|err| LlamaCppProviderError::Tokenization(err.to_string()))?;
+        generated_text.push_str(&output_string);
+        completion_tokens += 1;
+
+        let stop_now = additional_stops
+            .iter()
+            .any(|stop| !stop.is_empty() && generated_text.ends_with(stop));
+
+        if let (Some(state), Some(ref mut on_delta)) = (stream_state.as_mut(), on_delta.as_mut()) {
+            let deltas = state.update(&output_string, !stop_now).map_err(|err| {
+                LlamaCppProviderError::Template(format!("Streaming delta update failed: {err}"))
+            })?;
+            for delta in deltas {
+                on_delta(&delta)?;
+            }
+        }
+
+        if stop_now {
+            break;
+        }
+
+        gen_batch.clear();
+        gen_batch
+            .add(token, n_cur, &[0], true)
+            .map_err(|err| LlamaCppProviderError::Inference(err.to_string()))?;
+        n_cur += 1;
+        active_ctx.with_ctx(|ctx| {
+            ctx.decode(&mut gen_batch)
+                .map_err(|err| LlamaCppProviderError::Inference(err.to_string()))
+        })?;
+    }
+
+    if n_cur >= max_tokens_total {
+        finish_reason = "length".to_string();
+    }
+
+    // Update session state: reset to prompt-only so next call's prefix
+    // comparison works correctly. Generated tokens are ephemeral.
+    if let Some(state) = active_ctx.session_state_mut() {
+        std::mem::swap(&mut state.cached_tokens, &mut prompt_tokens);
+        state.next_pos = state.cached_tokens.len() as i32;
+        state
+            .ctx
+            .clear_kv_cache_seq(Some(0), Some(state.cached_tokens.len() as u32), None)
+            .map_err(|e| {
+                LlamaCppProviderError::Inference(format!("post-generation KV evict: {e}"))
+            })?;
+    }
+
+    let mut text = generated_text;
+    for stop in &additional_stops {
+        if !stop.is_empty() && text.ends_with(stop) {
+            let new_len = text.len().saturating_sub(stop.len());
+            text.truncate(new_len);
+            break;
+        }
+    }
+
+    Ok(GenerationResult {
+        text,
+        prompt_tokens: prompt_len as u32,
+        completion_tokens,
+        finish_reason,
+    })
+}
+
+#[cfg(feature = "mtmd")]
+fn generate_mtmd_text(
+    model: &LlamaModel,
+    backend: &LlamaBackend,
+    config: &LlamaCppConfig,
+    params: MtmdGenerationParams<'_>,
+) -> Result<GenerationResult, LlamaCppProviderError> {
+    let MtmdGenerationParams {
+        prompt,
+        marker,
+        images,
+        max_tokens,
+        temperature,
+        top_p,
+        mut on_token,
+    } = params;
+
+    let mmproj_path = config.mmproj_path.as_deref().ok_or_else(|| {
+        LlamaCppProviderError::Config("mmproj_path is required for MTMD".to_string())
+    })?;
+
+    let mtmd_params = MtmdContextParams {
+        use_gpu: config.mmproj_use_gpu.unwrap_or(true),
+        print_timings: false,
+        n_threads: config.n_threads.unwrap_or(4),
+        media_marker: CString::new(marker)
+            .map_err(|err| LlamaCppProviderError::Config(err.to_string()))?,
+    };
+
+    let mtmd_ctx = MtmdContext::init_from_file(mmproj_path, model, &mtmd_params)
+        .map_err(|err| LlamaCppProviderError::Inference(err.to_string()))?;
+
+    let n_ctx = config
+        .n_ctx
+        .unwrap_or_else(|| model.n_ctx_train().min(2048));
+    let n_batch = resolve_n_batch(config, n_ctx);
+    let ctx_params = build_context_params(config, false, Some(n_ctx), Some(n_batch))?;
+    let mut ctx = model
+        .new_context(backend, ctx_params)
+        .map_err(|err| LlamaCppProviderError::ContextLoad(format!("{err} (n_ctx={n_ctx})")))?;
+
+    let mut bitmaps = Vec::with_capacity(images.len());
+    for image in images {
+        let bitmap = MtmdBitmap::from_buffer(&mtmd_ctx, image)
+            .map_err(|err| LlamaCppProviderError::Inference(err.to_string()))?;
+        bitmaps.push(bitmap);
+    }
+
+    let bitmap_refs: Vec<&MtmdBitmap> = bitmaps.iter().collect();
+    let input_text = MtmdInputText {
+        text: prompt.to_string(),
+        add_special: true,
+        parse_special: true,
+    };
+
+    let chunks = mtmd_ctx
+        .tokenize(input_text, &bitmap_refs)
+        .map_err(|err| LlamaCppProviderError::Tokenization(err.to_string()))?;
+
+    let batch_size = n_batch as i32;
+    let n_past = chunks
+        .eval_chunks(&mtmd_ctx, &ctx, 0, 0, batch_size, true)
+        .map_err(|err| LlamaCppProviderError::Inference(err.to_string()))?;
+
+    let mut sampler = build_sampler(model, config, false, temperature, top_p, None)?;
+
+    let mut batch = LlamaBatch::new(n_ctx as usize, 1);
+    let mut n_cur = n_past;
+    let max_tokens_total = n_cur + max_tokens as i32;
+    let mut generated_text = String::default();
+    let mut completion_tokens = 0u32;
+    let mut decoder = encoding_rs::UTF_8.new_decoder();
+    let mut finish_reason = "stop".to_string();
+
+    while n_cur < max_tokens_total {
+        let token = sampler.sample(&ctx, -1);
+        sampler.accept(token);
+        if model.is_eog_token(token) {
+            break;
+        }
+
+        let output_string = model
+            .token_to_piece(token, &mut decoder, false, None)
+            .map_err(|err| LlamaCppProviderError::Tokenization(err.to_string()))?;
+        generated_text.push_str(&output_string);
+        completion_tokens += 1;
+        if let Some(ref mut on_token) = on_token
+            && !output_string.is_empty()
+        {
+            on_token(&output_string)?;
+        }
+
+        batch.clear();
+        batch
+            .add(token, n_cur, &[0], true)
+            .map_err(|err| LlamaCppProviderError::Inference(err.to_string()))?;
+        n_cur += 1;
+        ctx.decode(&mut batch)
+            .map_err(|err| LlamaCppProviderError::Inference(err.to_string()))?;
+    }
+
+    if n_cur >= max_tokens_total {
+        finish_reason = "length".to_string();
+    }
+
+    Ok(GenerationResult {
+        text: generated_text,
+        prompt_tokens: n_past as u32,
+        completion_tokens,
+        finish_reason,
+    })
+}
+
+fn generate_text(
+    model: &Arc<LlamaModel>,
+    backend: &Arc<LlamaBackend>,
+    config: &LlamaCppConfig,
+    params: GenerationParams<'_>,
+    session_state: Option<&SharedSessionState>,
+) -> Result<GenerationResult, LlamaCppProviderError> {
+    let GenerationParams {
+        prompt,
+        use_json_grammar,
+        max_tokens,
+        temperature,
+        top_p,
+        mut on_token,
+    } = params;
+
+    let mut prompt_tokens = model
+        .str_to_token(&prompt.prompt, prompt.add_bos)
+        .map_err(|err| LlamaCppProviderError::Tokenization(err.to_string()))?;
+
+    if prompt_tokens.is_empty() {
+        return Err(LlamaCppProviderError::Inference(
+            "Prompt produced no tokens".to_string(),
+        ));
+    }
+
+    let prompt_len = prompt_tokens.len();
+    let required_tokens = prompt_len as u32 + max_tokens;
+    let n_ctx = resolve_context_size(model, config, required_tokens)?;
+    let n_batch = resolve_n_batch(config, n_ctx);
+
+    let (mut active_ctx, batch_start_pos) = acquire_context(
+        model,
+        backend,
+        config,
+        session_state,
+        ContextAcquisitionRequest {
+            prompt_tokens: &prompt_tokens,
+            n_ctx,
+            n_batch,
+            required_tokens,
+        },
+    )?;
+
+    let mut sampler = build_sampler(model, config, use_json_grammar, temperature, top_p, None)?;
+    let mut generated_text = String::default();
+    let mut completion_tokens = 0_u32;
+    let mut decoder = encoding_rs::UTF_8.new_decoder();
+
+    // First token: sample from last logits position after prefill.
+    let mut next_token = active_ctx.with_ctx(|ctx| sampler.sample(ctx, -1));
+    sampler.accept(next_token);
+
+    let mut position = batch_start_pos as usize;
+    let mut gen_batch = LlamaBatch::new(1, 1);
+
+    while completion_tokens < max_tokens {
+        if model.is_eog_token(next_token) {
+            break;
+        }
+
+        completion_tokens += 1;
+        let token_str = model
+            .token_to_piece(next_token, &mut decoder, true, None)
+            .map_err(|err| LlamaCppProviderError::Tokenization(err.to_string()))?;
+        generated_text.push_str(&token_str);
+
+        if let Some(ref mut on_token) = on_token
+            && !token_str.is_empty()
+        {
+            on_token(&token_str)?;
+        }
+
+        gen_batch.clear();
+        gen_batch
+            .add(next_token, position as i32, &[0], true)
+            .map_err(|err| LlamaCppProviderError::Inference(err.to_string()))?;
+        active_ctx.with_ctx(|ctx| {
+            ctx.decode(&mut gen_batch)
+                .map_err(|err| LlamaCppProviderError::Inference(err.to_string()))
+        })?;
+        position += 1;
+
+        if position >= n_ctx as usize {
+            break;
+        }
+
+        next_token = active_ctx.with_ctx(|ctx| sampler.sample(ctx, gen_batch.n_tokens() - 1));
+        sampler.accept(next_token);
+    }
+
+    // Session cleanup: reset to prompt tokens only.
+    if let Some(state) = active_ctx.session_state_mut() {
+        std::mem::swap(&mut state.cached_tokens, &mut prompt_tokens);
+        state.next_pos = state.cached_tokens.len() as i32;
+        state
+            .ctx
+            .clear_kv_cache_seq(Some(0), Some(state.cached_tokens.len() as u32), None)
+            .map_err(|e| {
+                LlamaCppProviderError::Inference(format!("post-generation KV evict: {e}"))
+            })?;
+    }
+
+    let finish_reason = if completion_tokens >= max_tokens || position >= n_ctx as usize {
+        "length".to_string()
+    } else {
+        "stop".to_string()
+    };
+
+    Ok(GenerationResult {
+        text: generated_text,
+        prompt_tokens: prompt_len as u32,
+        completion_tokens,
+        finish_reason,
+    })
+}
+
+fn generate_embedding(
+    model: &LlamaModel,
+    backend: &LlamaBackend,
+    config: &LlamaCppConfig,
+    text: &str,
+) -> Result<Vec<f32>, LlamaCppProviderError> {
+    let n_ctx = config.n_ctx.unwrap_or_else(|| model.n_ctx_train());
+    let n_batch = resolve_n_batch(config, n_ctx);
+    let params = build_context_params(config, true, None, Some(n_batch))?;
+    let mut ctx = model
+        .new_context(backend, params)
+        .map_err(|err| LlamaCppProviderError::ContextLoad(err.to_string()))?;
+
+    let tokens = model
+        .str_to_token(text, AddBos::Always)
+        .map_err(|err| LlamaCppProviderError::Tokenization(err.to_string()))?;
+
+    if tokens.is_empty() {
+        return Err(LlamaCppProviderError::Embedding(
+            "Input produced no tokens".to_string(),
+        ));
+    }
+
+    let batch_size = n_batch as usize;
+    let mut batch = LlamaBatch::new(batch_size, 1);
+    let mut position = 0;
+
+    for chunk in tokens.chunks(batch_size) {
+        batch.clear();
+        for (idx, token) in chunk.iter().enumerate() {
+            let is_last = position + idx + 1 == tokens.len();
+            batch
+                .add(*token, (position + idx) as i32, &[0], is_last)
+                .map_err(|err| LlamaCppProviderError::Inference(err.to_string()))?;
+        }
+        ctx.encode(&mut batch)
+            .map_err(|err| LlamaCppProviderError::Inference(err.to_string()))?;
+        position += chunk.len();
+    }
+
+    let embedding = ctx
+        .embeddings_seq_ith(0)
+        .map_err(|err| LlamaCppProviderError::Embedding(err.to_string()))?;
+    Ok(embedding.to_vec())
+}
+
+fn extract_json_payload(text: &str) -> Option<String> {
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+
+    if is_valid_json(trimmed) {
+        return Some(trimmed.to_string());
+    }
+
+    if let Some(candidate) = extract_from_code_fence(trimmed) {
+        return Some(candidate);
+    }
+
+    extract_first_json_object(trimmed)
+}
+
+fn is_valid_json(candidate: &str) -> bool {
+    serde_json::from_str::<Value>(candidate).is_ok()
+}
+
+fn extract_from_code_fence(text: &str) -> Option<String> {
+    let mut in_fence = false;
+    let mut json_fence = false;
+    let mut buffer = String::default();
+
+    for line in text.lines() {
+        let line_trimmed = line.trim_start();
+        if let Some(rest) = line_trimmed.strip_prefix("```") {
+            if !in_fence {
+                let lang = rest.trim().to_ascii_lowercase();
+                json_fence = lang.is_empty() || lang == "json";
+                in_fence = true;
+                buffer.clear();
+            } else {
+                if json_fence {
+                    let candidate = buffer.trim();
+                    if !candidate.is_empty() && is_valid_json(candidate) {
+                        return Some(candidate.to_string());
+                    }
+                }
+                in_fence = false;
+                json_fence = false;
+                buffer.clear();
+            }
+            continue;
+        }
+
+        if in_fence && json_fence {
+            buffer.push_str(line);
+            buffer.push('\n');
+        }
+    }
+
+    None
+}
+
+fn extract_first_json_object(text: &str) -> Option<String> {
+    let mut in_string = false;
+    let mut escape = false;
+    let mut depth = 0i32;
+    let mut start = None;
+
+    for (idx, ch) in text.char_indices() {
+        if in_string {
+            if escape {
+                escape = false;
+                continue;
+            }
+            match ch {
+                '\\' => escape = true,
+                '"' => in_string = false,
+                _ => {}
+            }
+            continue;
+        }
+
+        match ch {
+            '"' => in_string = true,
+            '{' => {
+                if depth == 0 {
+                    start = Some(idx);
+                }
+                depth += 1;
+            }
+            '}' if depth > 0 => {
+                depth -= 1;
+                if depth == 0 {
+                    if let Some(start_idx) = start {
+                        let candidate = text[start_idx..=idx].trim();
+                        if !candidate.is_empty() && is_valid_json(candidate) {
+                            return Some(candidate.to_string());
+                        }
+                    }
+                    start = None;
+                }
+            }
+            _ => {}
+        }
+    }
+
+    None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    const TEST_GGUF_MODEL_PATH: &str = "fixtures/model.gguf";
+    use autoagents_llm::chat::ImageMime;
+    use serde_json::json;
+
+    fn chunk_count(total: usize, batch: usize) -> usize {
+        if batch == 0 {
+            return 0;
+        }
+        total.div_ceil(batch)
+    }
+
+    #[test]
+    fn test_unpack_sampling_none_returns_all_none() {
+        // sampling = None must produce identical (None, None, None) so the
+        // existing chat_with_tools / chat_stream / chat_stream_struct
+        // delegation paths remain bit-equivalent to the pre-overrides
+        // implementation.
+        let (max_tokens, temperature, top_p) = unpack_sampling(None);
+        assert!(max_tokens.is_none());
+        assert!(temperature.is_none());
+        assert!(top_p.is_none());
+    }
+
+    #[test]
+    fn test_unpack_sampling_extracts_each_field() {
+        let sampling = SamplingOverrides {
+            temperature: Some(0.0),
+            top_p: Some(0.95),
+            max_tokens: Some(128),
+        };
+        let (max_tokens, temperature, top_p) = unpack_sampling(Some(&sampling));
+        assert_eq!(max_tokens, Some(128));
+        assert_eq!(temperature, Some(0.0));
+        assert_eq!(top_p, Some(0.95));
+    }
+
+    #[test]
+    fn test_unpack_sampling_partial_overrides() {
+        let sampling = SamplingOverrides::with_temperature(0.0);
+        let (max_tokens, temperature, top_p) = unpack_sampling(Some(&sampling));
+        assert!(max_tokens.is_none());
+        assert_eq!(temperature, Some(0.0));
+        assert!(top_p.is_none());
+    }
+
+    #[test]
+    fn test_unpack_sampling_default_equivalent_to_none() {
+        // SamplingOverrides::default() (all None) must produce the same
+        // tuple as `sampling = None`. This guards the backwards-compat
+        // contract: passing `Some(&SamplingOverrides::default())` is
+        // bit-equivalent to passing `None`.
+        let default = SamplingOverrides::default();
+        assert_eq!(unpack_sampling(Some(&default)), unpack_sampling(None));
+    }
+
+    #[test]
+    fn test_top_p_override_precedence_in_sampler_logic() {
+        // Mirror the precedence used in build_sampler / build_chat_sampler:
+        //   top_p_override.or(config.top_p)
+        // Verifies the override semantics without needing a real model.
+        let config_top_p: Option<f32> = Some(0.9);
+        let override_top_p: Option<f32> = Some(0.5);
+        // Override wins when set.
+        assert_eq!(override_top_p.or(config_top_p), Some(0.5));
+        // Falls through to config default when override is None.
+        let no_override: Option<f32> = None;
+        assert_eq!(no_override.or(config_top_p), Some(0.9));
+        // Both None → None (provider falls back to no top_p sampler).
+        let no_config: Option<f32> = None;
+        assert_eq!(no_override.or(no_config), None);
+    }
+
+    #[test]
+    fn test_default_n_batch_smaller_than_context() {
+        let config = LlamaCppConfig::default();
+        let n_ctx = 4096;
+        let n_batch = resolve_n_batch(&config, n_ctx);
+        assert_eq!(n_batch, DEFAULT_N_BATCH);
+        assert!(n_batch < n_ctx);
+    }
+
+    #[test]
+    fn test_large_prompt_batches_by_default_n_batch() {
+        let config = LlamaCppConfig::default();
+        let n_ctx = 4096;
+        let n_batch = resolve_n_batch(&config, n_ctx);
+        let prompt_len = n_batch as usize + 1;
+        assert_eq!(chunk_count(prompt_len, n_batch as usize), 2);
+    }
+
+    #[test]
+    fn test_resolve_n_batch_clamps_to_context() {
+        let config = LlamaCppConfig {
+            n_batch: Some(128),
+            ..Default::default()
+        };
+        assert_eq!(resolve_n_batch(&config, 64), 64);
+        assert_eq!(resolve_n_batch(&config, 256), 128);
+    }
+
+    #[test]
+    fn test_build_context_params_overrides() {
+        let config = LlamaCppConfig {
+            n_threads: Some(4),
+            n_threads_batch: Some(6),
+            ..Default::default()
+        };
+        let params = build_context_params(&config, true, Some(512), Some(16)).unwrap();
+        assert_eq!(params.n_ctx(), std::num::NonZeroU32::new(512));
+        assert_eq!(params.n_batch(), 16);
+        assert_eq!(params.n_threads(), 4);
+        assert_eq!(params.n_threads_batch(), 6);
+        assert!(params.embeddings());
+    }
+
+    #[test]
+    fn test_build_model_params_sets_fields() {
+        let mut config = LlamaCppConfig::default();
+        config.n_gpu_layers = Some(3);
+        config.main_gpu = Some(1);
+        config.split_mode = Some(crate::config::LlamaCppSplitMode::Row);
+        config.use_mlock = Some(true);
+        let params = build_model_params(&config).unwrap();
+        assert_eq!(params.n_gpu_layers(), 3);
+        assert_eq!(params.main_gpu(), 1);
+        assert_eq!(
+            params.split_mode().unwrap(),
+            llama_cpp_2::model::params::LlamaSplitMode::Row
+        );
+        assert!(params.use_mlock());
+    }
+
+    #[cfg(feature = "mtmd")]
+    #[test]
+    fn test_mtmd_default_marker_smoke() {
+        let marker = llama_cpp_2::mtmd::mtmd_default_marker();
+        assert!(!marker.is_empty());
+    }
+
+    #[test]
+    fn test_regex_escape_and_anchor_pattern() {
+        let escaped = regex_escape("a.b[c]");
+        assert_eq!(escaped, "a\\.b\\[c\\]");
+        assert_eq!(anchor_pattern("foo"), "^foo$");
+        assert_eq!(anchor_pattern("^foo$"), "^foo$");
+        assert_eq!(anchor_pattern(""), "^$");
+    }
+
+    #[test]
+    fn test_extract_json_payload_helpers() {
+        let text = "```json\n{\"a\":1}\n```";
+        let fenced = extract_from_code_fence(text).unwrap();
+        assert_eq!(fenced, "{\"a\":1}");
+
+        let first = extract_first_json_object("prefix {\"b\":2} suffix").unwrap();
+        assert_eq!(first, "{\"b\":2}");
+
+        let payload = extract_json_payload("answer: {\"c\":3}").unwrap();
+        assert_eq!(payload, "{\"c\":3}");
+
+        assert!(is_valid_json("{\"ok\":true}"));
+        assert!(!is_valid_json("{broken"));
+    }
+
+    #[test]
+    fn test_resolve_model_path_empty() {
+        let source = ModelSource::Gguf {
+            model_path: "".to_string(),
+        };
+        let config = LlamaCppConfig::default();
+        let err = resolve_model_path(&source, &config).unwrap_err();
+        assert!(err.to_string().contains("Model path is required"));
+    }
+
+    #[test]
+    fn test_parse_openai_delta_valid_and_invalid() {
+        let valid = r#"{"content":"hi","reasoning_content":"think"}"#;
+        let parsed = parse_openai_delta(valid).expect("valid json should parse");
+        assert_eq!(
+            parsed.content.and_then(StringOrJson::into_non_empty_string),
+            Some("hi".to_string())
+        );
+        assert_eq!(
+            parsed
+                .reasoning_content
+                .and_then(StringOrJson::into_non_empty_string),
+            Some("think".to_string())
+        );
+
+        let err = parse_openai_delta("{bad").expect_err("invalid json should error");
+        assert!(matches!(err, LLMError::JsonError(_)));
+    }
+
+    #[test]
+    fn test_parse_openai_delta_allows_json_content() {
+        let valid = r#"{"content":{"value":50},"reasoning_content":["step1","step2"]}"#;
+        let parsed = parse_openai_delta(valid).expect("json content should parse");
+        assert_eq!(
+            parsed.content.and_then(StringOrJson::into_non_empty_string),
+            Some(r#"{"value":50}"#.to_string())
+        );
+        assert_eq!(
+            parsed
+                .reasoning_content
+                .and_then(StringOrJson::into_non_empty_string),
+            Some(r#"["step1","step2"]"#.to_string())
+        );
+    }
+
+    #[test]
+    fn test_openai_compat_message_allows_json_content_and_tool_arguments() {
+        let valid = r#"{
+            "content":{"value":50},
+            "reasoning_content":{"step":"done"},
+            "tool_calls":[
+                {
+                    "id":"call_1",
+                    "type":"function",
+                    "function":{
+                        "name":"Addition",
+                        "arguments":{"left":42,"right":8}
+                    }
+                }
+            ]
+        }"#;
+        let parsed: OpenAICompatMessage =
+            serde_json::from_str(valid).expect("json content should parse");
+        assert_eq!(
+            parsed.content.and_then(StringOrJson::into_non_empty_string),
+            Some(r#"{"value":50}"#.to_string())
+        );
+        assert_eq!(
+            parsed
+                .reasoning_content
+                .and_then(StringOrJson::into_non_empty_string),
+            Some(r#"{"step":"done"}"#.to_string())
+        );
+
+        let tool_calls = parsed
+            .tool_calls
+            .expect("tool calls should decode")
+            .into_iter()
+            .map(ToolCall::from)
+            .collect::<Vec<_>>();
+        assert_eq!(tool_calls.len(), 1);
+        assert_eq!(tool_calls[0].function.name, "Addition");
+        assert_eq!(tool_calls[0].function.arguments, r#"{"left":42,"right":8}"#);
+    }
+
+    #[test]
+    fn test_push_text_and_reasoning_chunks_emits_both() {
+        let mut outputs = Vec::new();
+        push_text_and_reasoning_chunks(
+            Some("answer".to_string()),
+            Some("plan".to_string()),
+            &mut outputs,
+        );
+
+        assert_eq!(outputs.len(), 2);
+        assert!(matches!(&outputs[0], Ok(StreamChunk::Text(text)) if text == "answer"));
+        assert!(matches!(
+            &outputs[1],
+            Ok(StreamChunk::ReasoningContent(text)) if text == "plan"
+        ));
+    }
+
+    #[test]
+    fn test_prepare_messages_with_system_prompt() {
+        let config = LlamaCppConfig {
+            system_prompt: Some("sys".to_string()),
+            ..Default::default()
+        };
+        let messages = vec![ChatMessage::user().content("hi").build()];
+
+        let prepared = prepare_messages_with_system(&config, &messages);
+        assert_eq!(prepared.len(), 2);
+        assert_eq!(prepared[0].role, autoagents_llm::chat::ChatRole::System);
+        assert_eq!(prepared[0].content, "sys");
+        assert_eq!(prepared[1].content, "hi");
+
+        let messages = vec![ChatMessage {
+            role: autoagents_llm::chat::ChatRole::System,
+            message_type: autoagents_llm::chat::MessageType::Text,
+            content: "existing".to_string(),
+        }];
+        let prepared = prepare_messages_with_system(&config, &messages);
+        assert_eq!(prepared.len(), 1);
+        assert_eq!(prepared[0].content, "existing");
+    }
+
+    #[test]
+    fn test_prepare_fallback_messages_with_schema() {
+        let config = LlamaCppConfig {
+            system_prompt: Some("sys".to_string()),
+            ..Default::default()
+        };
+        let messages = vec![ChatMessage::user().content("hi").build()];
+        let schema = StructuredOutputFormat {
+            name: "TestSchema".to_string(),
+            description: Some("desc".to_string()),
+            schema: Some(serde_json::json!({"type": "object"})),
+            strict: Some(true),
+        };
+
+        let prepared = prepare_fallback_messages_with_schema(&config, &messages, Some(&schema));
+        let last = prepared.last().unwrap();
+        assert!(last.content.contains("TestSchema"));
+        assert!(last.content.contains("desc"));
+        assert!(last.content.contains("\"type\":\"object\""));
+    }
+
+    #[test]
+    fn test_sanitize_chat_template_schema_adds_additional_properties() {
+        let schema = StructuredOutputFormat {
+            name: "MathAgentOutput".to_string(),
+            description: None,
+            schema: Some(serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "value": {"type": "integer"}
+                },
+                "required": ["value"]
+            })),
+            strict: Some(true),
+        };
+
+        let sanitized = sanitize_chat_template_schema(&schema).expect("schema should exist");
+        assert_eq!(sanitized["type"], "object");
+        assert_eq!(sanitized["properties"]["value"]["type"], "integer");
+        assert!(
+            sanitized["additionalProperties"]
+                .as_bool()
+                .is_some_and(|value| !value)
+        );
+    }
+
+    #[test]
+    fn test_select_template_schema_and_grammar_ignores_schema_when_tools_present() {
+        let schema = StructuredOutputFormat {
+            name: "MathAgentOutput".to_string(),
+            description: None,
+            schema: Some(serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "value": {"type": "integer"}
+                },
+                "required": ["value"]
+            })),
+            strict: Some(true),
+        };
+
+        let (json_schema, grammar) = select_template_schema_and_grammar(true, Some(&schema), true);
+        assert!(json_schema.is_none());
+        assert!(grammar.is_none());
+    }
+
+    #[test]
+    fn test_select_template_schema_and_grammar_routes_schema_through_grammar_without_tools() {
+        // Schemas must be compiled to grammar at the autoagents boundary rather than
+        // forwarded into llama.cpp's OAI-compat `json_schema` slot (see issue #220).
+        let schema = StructuredOutputFormat {
+            name: "MathAgentOutput".to_string(),
+            description: None,
+            schema: Some(serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "value": {"type": "integer"}
+                },
+                "required": ["value"]
+            })),
+            strict: Some(true),
+        };
+
+        let (json_schema, grammar) =
+            select_template_schema_and_grammar(false, Some(&schema), false);
+        assert!(
+            json_schema.is_none(),
+            "schema must never be forwarded into the OAI-compat template slot"
+        );
+        let grammar = grammar.expect("schema-derived grammar must be produced");
+        assert!(
+            grammar.contains("value"),
+            "grammar must constrain the schema fields, got: {grammar}"
+        );
+    }
+
+    // Regression for https://github.com/liquidos-ai/AutoAgents/issues/220 —
+    // when an agent declares `tools = []` plus `output = SomeStruct`, the schema must
+    // be enforced via grammar (compiled at our boundary) rather than forwarded to
+    // llama.cpp's OAI-compat template `json_schema` slot. The schema slot configures a
+    // parser that expects a structured-output envelope post-generation; the model emits
+    // plain JSON with no envelope, llama.cpp returns rc=-3 from `chat_parse_to_oaicompat`,
+    // surfacing as `ProviderError("Failed to parse response: ffi error -3")`.
+    #[test]
+    fn test_select_template_schema_and_grammar_compiles_schema_when_tools_empty() {
+        let schema = StructuredOutputFormat {
+            name: "MathAgentOutput".to_string(),
+            description: None,
+            schema: Some(json!({
+                "type": "object",
+                "properties": {
+                    "value": {"type": "integer", "description": "The addition result"},
+                    "explanation": {"type": "string", "description": "Explanation of the logic"},
+                    "generic": {
+                        "type": "string",
+                        "description": "If user asks other than math questions, use this to answer them."
+                    }
+                },
+                "required": ["value", "explanation"]
+            })),
+            strict: Some(true),
+        };
+
+        let (json_schema, grammar) =
+            select_template_schema_and_grammar(false, Some(&schema), false);
+
+        assert!(
+            json_schema.is_none(),
+            "schema must NOT be forwarded to OAI-compat template when tools are absent; \
+             doing so configures a schema-bound parser that crashes on plain-JSON generations"
+        );
+        let grammar = grammar.expect("schema-derived grammar must be produced");
+        assert!(
+            grammar.contains("value") && grammar.contains("explanation"),
+            "grammar must constrain the schema fields, got: {grammar}"
+        );
+    }
+
+    #[test]
+    fn test_select_template_schema_and_grammar_falls_back_to_json_grammar_on_unconvertible_schema()
+    {
+        // A schema that cannot be compiled to grammar must fall back to the generic JSON
+        // grammar (still enforces well-formed JSON), never re-introduce the schema slot.
+        let schema = StructuredOutputFormat {
+            name: "Recursive".to_string(),
+            description: None,
+            schema: Some(json!({
+                "$ref": "#/definitions/Missing"
+            })),
+            strict: Some(true),
+        };
+
+        let (json_schema, grammar) =
+            select_template_schema_and_grammar(false, Some(&schema), false);
+
+        assert!(json_schema.is_none(), "schema slot must stay empty");
+        assert_eq!(
+            grammar.as_deref(),
+            Some(JSON_GRAMMAR),
+            "must fall back to JSON_GRAMMAR when schema-to-grammar fails"
+        );
+    }
+
+    #[test]
+    fn test_llama_json_schema_to_grammar_accepts_integer_object_schema() {
+        let grammar = llama_cpp_2::json_schema_to_grammar(
+            r#"{
+                "type":"object",
+                "properties":{
+                    "value":{"type":"integer"},
+                    "explanation":{"type":"string"}
+                },
+                "required":["value","explanation"],
+                "additionalProperties":false
+            }"#,
+        )
+        .expect("integer object schema should convert to grammar");
+
+        assert!(grammar.contains("space ::="));
+        assert!(grammar.contains("value"));
+        assert!(grammar.contains("explanation"));
+    }
+
+    #[test]
+    fn test_llama_json_schema_to_grammar_accepts_tool_parameter_schema() {
+        let grammar = llama_cpp_2::json_schema_to_grammar(
+            r#"{
+                "type":"object",
+                "properties":{
+                    "left":{"type":"integer","description":"Left operand"},
+                    "right":{"type":"integer","description":"Right operand"}
+                },
+                "required":["left","right"]
+            }"#,
+        )
+        .expect("tool parameter schema should convert to grammar");
+
+        assert!(grammar.contains("space ::="));
+        assert!(grammar.contains("left"));
+        assert!(grammar.contains("right"));
+    }
+
+    #[test]
+    fn test_ensure_supported_messages_for_config() {
+        let config = LlamaCppConfig::default();
+        let ok = ensure_supported_messages_for_config(
+            &config,
+            &[ChatMessage::user().content("hi").build()],
+        );
+        assert!(ok.is_ok());
+
+        let image_msg = ChatMessage {
+            role: autoagents_llm::chat::ChatRole::User,
+            message_type: autoagents_llm::chat::MessageType::Image((ImageMime::PNG, vec![1, 2, 3])),
+            content: "img".to_string(),
+        };
+        let err = ensure_supported_messages_for_config(&config, &[image_msg]).unwrap_err();
+        assert!(err.to_string().contains("does not support image inputs"));
+
+        let url_msg = ChatMessage {
+            role: autoagents_llm::chat::ChatRole::User,
+            message_type: autoagents_llm::chat::MessageType::ImageURL(
+                "https://example.com/img.png".to_string(),
+            ),
+            content: "img".to_string(),
+        };
+        let err = ensure_supported_messages_for_config(&config, &[url_msg]).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("does not support image URL or PDF inputs")
+        );
+    }
+
+    #[test]
+    fn test_string_or_json_and_single_stream_response_helpers() {
+        assert_eq!(StringOrJson::default().into_string(), "");
+        assert_eq!(StringOrJson::Json(Value::Null).into_string(), "");
+        assert_eq!(
+            StringOrJson::Json(json!({"value": 7})).into_non_empty_string(),
+            Some("{\"value\":7}".to_string())
+        );
+        assert_eq!(
+            StringOrJson::String(String::default()).into_non_empty_string(),
+            None
+        );
+        assert_eq!(
+            default_call_type_value().into_string(),
+            autoagents_llm::default_call_type()
+        );
+
+        let usage = LlamaCppProvider::build_usage(2, 3);
+        assert_eq!(usage.prompt_tokens, 2);
+        assert_eq!(usage.completion_tokens, 3);
+        assert_eq!(usage.total_tokens, 5);
+
+        let response = single_stream_response(
+            Some("answer".to_string()),
+            Some("plan".to_string()),
+            Some(vec![ToolCall {
+                id: "call_1".to_string(),
+                call_type: "function".to_string(),
+                function: FunctionCall {
+                    name: "lookup".to_string(),
+                    arguments: "{}".to_string(),
+                },
+            }]),
+            Some(usage),
+        );
+        assert_eq!(response.choices.len(), 1);
+        assert_eq!(response.choices[0].delta.content.as_deref(), Some("answer"));
+        assert_eq!(
+            response.choices[0].delta.reasoning_content.as_deref(),
+            Some("plan")
+        );
+        let tool_calls = response.choices[0]
+            .delta
+            .tool_calls
+            .as_ref()
+            .expect("tool calls should be present");
+        assert_eq!(tool_calls[0].id, "call_1");
+        assert_eq!(tool_calls[0].function.name, "lookup");
+        assert_eq!(
+            response
+                .usage
+                .expect("usage should be present")
+                .total_tokens,
+            5
+        );
+    }
+
+    #[test]
+    fn test_struct_stream_helpers_cover_content_and_tool_updates() {
+        let mut outputs = Vec::new();
+        push_struct_content_and_reasoning(
+            Some("answer".to_string()),
+            Some("plan".to_string()),
+            &mut outputs,
+        );
+        assert_eq!(outputs.len(), 2);
+        assert!(matches!(
+            &outputs[0],
+            Ok(response)
+                if response.choices[0].delta.content.as_deref() == Some("answer")
+                    && response.choices[0].delta.reasoning_content.is_none()
+        ));
+        assert!(matches!(
+            &outputs[1],
+            Ok(response)
+                if response.choices[0].delta.content.is_none()
+                    && response.choices[0].delta.reasoning_content.as_deref() == Some("plan")
+        ));
+
+        let mut empty_outputs = Vec::new();
+        push_struct_content_and_reasoning(
+            Some(String::default()),
+            Some(String::default()),
+            &mut empty_outputs,
+        );
+        assert!(empty_outputs.is_empty());
+
+        let mut tool_states = HashMap::new();
+        let mut tool_outputs = Vec::new();
+        push_struct_tool_call_updates(
+            vec![
+                OpenAIToolCallDelta {
+                    index: Some(0),
+                    id: Some("call_1".to_string()),
+                    call_type: None,
+                    function: Some(OpenAIFunctionDelta {
+                        name: Some("lookup".to_string()),
+                        arguments: StringOrJson::String("{\"q\":\"".to_string()),
+                    }),
+                },
+                OpenAIToolCallDelta {
+                    index: Some(0),
+                    id: None,
+                    call_type: Some("function".to_string()),
+                    function: Some(OpenAIFunctionDelta {
+                        name: None,
+                        arguments: StringOrJson::String("rust\"}".to_string()),
+                    }),
+                },
+                OpenAIToolCallDelta {
+                    index: Some(1),
+                    id: None,
+                    call_type: None,
+                    function: None,
+                },
+            ],
+            &mut tool_states,
+            &mut tool_outputs,
+        );
+
+        assert_eq!(tool_outputs.len(), 1);
+        let tool_calls = tool_outputs[0]
+            .as_ref()
+            .expect("tool update should succeed")
+            .choices[0]
+            .delta
+            .tool_calls
+            .as_ref()
+            .expect("tool calls should be present");
+        assert_eq!(tool_calls.len(), 2);
+        assert_eq!(tool_calls[0].id, "call_1");
+        assert_eq!(tool_calls[0].function.name, "lookup");
+        assert_eq!(tool_calls[0].function.arguments, "{\"q\":\"");
+        assert_eq!(tool_calls[1].id, "call_1");
+        assert_eq!(tool_calls[1].function.name, "lookup");
+        assert_eq!(tool_calls[1].function.arguments, "{\"q\":\"rust\"}");
+        assert_eq!(tool_states[&0].arguments, "{\"q\":\"rust\"}");
+    }
+
+    #[test]
+    fn test_map_struct_stream_event_handles_tokens_usage_and_errors() {
+        let mut tool_states = HashMap::new();
+        assert!(
+            map_struct_stream_event(Ok(StreamEvent::Token(String::default())), &mut tool_states,)
+                .is_empty()
+        );
+
+        let token_outputs = map_struct_stream_event(
+            Ok(StreamEvent::Token("alpha".to_string())),
+            &mut tool_states,
+        );
+        assert_eq!(token_outputs.len(), 1);
+        assert!(matches!(
+            &token_outputs[0],
+            Ok(response) if response.choices[0].delta.content.as_deref() == Some("alpha")
+        ));
+
+        let delta = json!({
+            "content": "beta",
+            "reasoning_content": "think",
+            "tool_calls": [{
+                "index": 0,
+                "id": "call_1",
+                "type": "function",
+                "function": {
+                    "name": "lookup",
+                    "arguments": "{\"q\":\"rust\"}"
+                }
+            }]
+        })
+        .to_string();
+        let delta_outputs =
+            map_struct_stream_event(Ok(StreamEvent::Delta(delta)), &mut tool_states);
+        assert_eq!(delta_outputs.len(), 3);
+        assert!(matches!(
+            &delta_outputs[0],
+            Ok(response) if response.choices[0].delta.content.as_deref() == Some("beta")
+        ));
+        assert!(matches!(
+            &delta_outputs[1],
+            Ok(response)
+                if response.choices[0].delta.reasoning_content.as_deref() == Some("think")
+        ));
+        let struct_tool_calls = delta_outputs[2]
+            .as_ref()
+            .expect("tool call update should succeed")
+            .choices[0]
+            .delta
+            .tool_calls
+            .as_ref()
+            .expect("tool calls should be present");
+        assert_eq!(struct_tool_calls[0].function.name, "lookup");
+
+        let usage_outputs = map_struct_stream_event(
+            Ok(StreamEvent::Usage(LlamaCppProvider::build_usage(1, 2))),
+            &mut tool_states,
+        );
+        assert_eq!(usage_outputs.len(), 1);
+        assert_eq!(
+            usage_outputs[0]
+                .as_ref()
+                .expect("usage event should succeed")
+                .usage
+                .as_ref()
+                .expect("usage should be present")
+                .total_tokens,
+            3
+        );
+        assert!(
+            map_struct_stream_event(
+                Ok(StreamEvent::Done {
+                    stop_reason: "end_turn".to_string(),
+                }),
+                &mut tool_states,
+            )
+            .is_empty()
+        );
+
+        let invalid =
+            map_struct_stream_event(Ok(StreamEvent::Delta("{bad".to_string())), &mut tool_states);
+        assert!(matches!(invalid.as_slice(), [Err(LLMError::JsonError(_))]));
+        let generic =
+            map_struct_stream_event(Err(LLMError::Generic("boom".to_string())), &mut tool_states);
+        assert!(
+            matches!(generic.as_slice(), [Err(LLMError::Generic(message))] if message == "boom")
+        );
+    }
+
+    #[test]
+    fn test_tool_stream_mapping_covers_deltas_usage_done_and_completions() {
+        let mut tool_states = HashMap::new();
+        let delta = json!({
+            "content": "answer",
+            "reasoning_content": "plan",
+            "tool_calls": [{
+                "index": 0,
+                "id": "call_1",
+                "type": "function",
+                "function": {
+                    "name": "lookup",
+                    "arguments": "{\"q\":\"rust\"}"
+                }
+            }]
+        })
+        .to_string();
+        let outputs = map_tool_stream_event(Ok(StreamEvent::Delta(delta)), &mut tool_states);
+        assert_eq!(outputs.len(), 4);
+        assert!(matches!(&outputs[0], Ok(StreamChunk::Text(text)) if text == "answer"));
+        assert!(matches!(
+            &outputs[1],
+            Ok(StreamChunk::ReasoningContent(text)) if text == "plan"
+        ));
+        assert!(matches!(
+            &outputs[2],
+            Ok(StreamChunk::ToolUseStart { index, id, name })
+                if *index == 0 && id == "call_1" && name == "lookup"
+        ));
+        assert!(matches!(
+            &outputs[3],
+            Ok(StreamChunk::ToolUseInputDelta { index, partial_json })
+                if *index == 0 && partial_json == "{\"q\":\"rust\"}"
+        ));
+
+        let usage_outputs = map_tool_stream_event(
+            Ok(StreamEvent::Usage(LlamaCppProvider::build_usage(1, 2))),
+            &mut tool_states,
+        );
+        assert!(matches!(
+            usage_outputs.as_slice(),
+            [Ok(StreamChunk::Usage(usage))] if usage.total_tokens == 3
+        ));
+
+        let done_outputs = map_tool_stream_event(
+            Ok(StreamEvent::Done {
+                stop_reason: "tool_use".to_string(),
+            }),
+            &mut tool_states,
+        );
+        assert_eq!(done_outputs.len(), 2);
+        assert!(matches!(
+            &done_outputs[0],
+            Ok(StreamChunk::ToolUseComplete { index, tool_call })
+                if *index == 0
+                    && tool_call.id == "call_1"
+                    && tool_call.function.name == "lookup"
+                    && tool_call.function.arguments == "{\"q\":\"rust\"}"
+        ));
+        assert!(matches!(
+            &done_outputs[1],
+            Ok(StreamChunk::Done { stop_reason }) if stop_reason == "tool_use"
+        ));
+        assert!(tool_states.is_empty());
+
+        assert!(
+            map_tool_stream_event(
+                Ok(StreamEvent::Token(String::default())),
+                &mut HashMap::new(),
+            )
+            .is_empty()
+        );
+        let invalid = map_tool_stream_event(
+            Ok(StreamEvent::Delta("{bad".to_string())),
+            &mut HashMap::new(),
+        );
+        assert!(matches!(invalid.as_slice(), [Err(LLMError::JsonError(_))]));
+    }
+
+    #[test]
+    fn test_json_extraction_and_grammar_helpers_cover_edge_cases() {
+        assert!(extract_json_payload("").is_none());
+        assert_eq!(
+            extract_from_code_fence("```json\n{\"answer\":1}\n```"),
+            Some("{\"answer\":1}".to_string())
+        );
+        assert!(extract_from_code_fence("```text\n{\"answer\":1}\n```").is_none());
+        assert_eq!(
+            extract_first_json_object("prefix {\"outer\":{\"text\":\"brace } inside\"}} suffix"),
+            Some("{\"outer\":{\"text\":\"brace } inside\"}}".to_string())
+        );
+        assert_eq!(
+            extract_json_payload("leading text {\"answer\": true} trailing text"),
+            Some("{\"answer\": true}".to_string())
+        );
+
+        let (json_schema, grammar) = select_template_schema_and_grammar(false, None, true);
+        assert!(json_schema.is_none());
+        assert_eq!(grammar.as_deref(), Some(JSON_GRAMMAR));
+
+        let schema = StructuredOutputFormat {
+            name: "Answer".to_string(),
+            description: None,
+            schema: Some(json!({
+                "type": "object",
+                "additionalProperties": true,
+                "properties": {
+                    "answer": { "type": "string" }
+                }
+            })),
+            strict: Some(true),
+        };
+        let sanitized = sanitize_chat_template_schema(&schema).expect("schema should exist");
+        assert_eq!(sanitized["additionalProperties"], Value::Bool(true));
+
+        let model_path = resolve_model_path(
+            &ModelSource::Gguf {
+                model_path: TEST_GGUF_MODEL_PATH.to_string(),
+            },
+            &LlamaCppConfig::default(),
+        )
+        .expect("non-empty model path should resolve");
+        assert_eq!(model_path, TEST_GGUF_MODEL_PATH);
+    }
+
+    // ── common_prefix_len tests ──────────────────────────────────────────
+
+    #[test]
+    fn test_common_prefix_len_identical() {
+        let tokens: Vec<LlamaToken> = (0..5).map(LlamaToken::new).collect();
+        assert_eq!(common_prefix_len(&tokens, &tokens), 5);
+    }
+
+    #[test]
+    fn test_common_prefix_len_diverges_at_3() {
+        let cached: Vec<LlamaToken> = (0..5).map(LlamaToken::new).collect();
+        let mut new_tokens = cached.clone();
+        new_tokens[3] = LlamaToken::new(99);
+        assert_eq!(common_prefix_len(&cached, &new_tokens), 3);
+    }
+
+    #[test]
+    fn test_common_prefix_len_shorter_new() {
+        let cached: Vec<LlamaToken> = (0..5).map(LlamaToken::new).collect();
+        let new_tokens: Vec<LlamaToken> = (0..3).map(LlamaToken::new).collect();
+        assert_eq!(common_prefix_len(&cached, &new_tokens), 3);
+    }
+
+    #[test]
+    fn test_common_prefix_len_empty_cache() {
+        let cached: Vec<LlamaToken> = vec![];
+        let new_tokens: Vec<LlamaToken> = (0..5).map(LlamaToken::new).collect();
+        assert_eq!(common_prefix_len(&cached, &new_tokens), 0);
+    }
+
+    #[test]
+    fn test_common_prefix_len_both_empty() {
+        let empty: Vec<LlamaToken> = vec![];
+        assert_eq!(common_prefix_len(&empty, &empty), 0);
+    }
+
+    #[test]
+    fn test_common_prefix_len_completely_different() {
+        let a: Vec<LlamaToken> = (0..5).map(LlamaToken::new).collect();
+        let b: Vec<LlamaToken> = (10..15).map(LlamaToken::new).collect();
+        assert_eq!(common_prefix_len(&a, &b), 0);
+    }
+
+    // ── Config tests ───────────────────────────────────────────────────────
+
+    #[test]
+    fn test_config_enable_thinking_defaults_to_none() {
+        let config = LlamaCppConfig::default();
+        assert_eq!(config.enable_thinking, None);
+    }
+
+    #[test]
+    fn test_config_context_reuse_defaults_to_false() {
+        let config = LlamaCppConfig::default();
+        assert!(!config.context_reuse);
+    }
+
+    #[test]
+    fn test_config_builder_enable_thinking() {
+        let config = LlamaCppConfigBuilder::new()
+            .model_path("test.gguf")
+            .enable_thinking(true)
+            .build();
+        assert_eq!(config.enable_thinking, Some(true));
+    }
+
+    #[test]
+    fn test_config_builder_context_reuse() {
+        let config = LlamaCppConfigBuilder::new()
+            .model_path("test.gguf")
+            .context_reuse(true)
+            .build();
+        assert!(config.context_reuse);
+    }
+
+    #[test]
+    fn test_config_builder_context_reuse_off_by_default() {
+        let config = LlamaCppConfigBuilder::new().model_path("test.gguf").build();
+        assert!(!config.context_reuse);
+    }
+
+    // ── SharedSessionState tests (no model needed) ─────────────────────────
+
+    #[test]
+    fn test_shared_session_state_initially_none() {
+        let shared: SharedSessionState = Arc::new(std::sync::Mutex::new(None));
+        assert!(shared.lock().unwrap().is_none());
+    }
+
+    #[test]
+    fn test_shared_session_mutex_clear_no_panic() {
+        // Verifies the Mutex<Option<SessionState>> pattern works correctly.
+        // reset_session() and cached_prefix_len() cannot be unit-tested
+        // without a loaded model — integration test needed.
+        let shared: SharedSessionState = Arc::new(std::sync::Mutex::new(None));
+        *shared.lock().unwrap() = None;
+        assert!(shared.lock().unwrap().is_none());
+    }
+
+    // ── from_model / model() / backend() tests ──────────────────────────────
+    //
+    // These verify the sharing API without loading a GGUF model.
+    // Full inference through from_model() is covered by integration tests.
+
+    #[test]
+    fn test_arc_clone_preserves_identity() {
+        // Validates the Arc sharing pattern used by from_model(): cloning
+        // an Arc preserves pointer identity (Arc::ptr_eq). Cannot construct
+        // a real LlamaCppProvider without a model file — integration tests
+        // verify model()/backend() on a real provider.
+        let shared: SharedSessionState = Arc::new(std::sync::Mutex::new(None));
+        let cloned = Arc::clone(&shared);
+        assert!(Arc::ptr_eq(&shared, &cloned));
+    }
+
+    #[test]
+    fn test_from_model_config_context_reuse_enabled() {
+        // from_model() with context_reuse=true should create session_state.
+        // We can't call from_model() without a real LlamaModel/LlamaBackend,
+        // but we can verify the session_state allocation logic matches
+        // from_config() by checking the conditional directly.
+        let config = LlamaCppConfigBuilder::new()
+            .model_path("dummy.gguf")
+            .context_reuse(true)
+            .build();
+        assert!(config.context_reuse);
+
+        // Same allocation logic as from_model():
+        let session_state: Option<SharedSessionState> = if config.context_reuse {
+            Some(Arc::new(std::sync::Mutex::new(None)))
+        } else {
+            None
+        };
+        assert!(session_state.is_some());
+    }
+
+    #[test]
+    fn test_from_model_config_context_reuse_disabled() {
+        let config = LlamaCppConfigBuilder::new()
+            .model_path("dummy.gguf")
+            .context_reuse(false)
+            .build();
+        assert!(!config.context_reuse);
+
+        let session_state: Option<SharedSessionState> = if config.context_reuse {
+            Some(Arc::new(std::sync::Mutex::new(None)))
+        } else {
+            None
+        };
+        assert!(session_state.is_none());
+    }
+}

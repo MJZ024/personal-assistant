@@ -1,0 +1,128 @@
+use autoagents::async_trait;
+/// This example demonstrates Agent Streaming
+use autoagents::core::agent::memory::SlidingWindowMemory;
+use autoagents::core::agent::prebuilt::executor::{ReActAgent, ReActAgentOutput};
+use autoagents::core::agent::task::Task;
+use autoagents::core::agent::{AgentBuilder, AgentOutputT, DirectAgent};
+use autoagents::core::error::Error;
+use autoagents::core::tool::{ToolCallError, ToolRuntime, ToolT};
+use autoagents::llm::LLMProvider;
+use autoagents_derive::{AgentHooks, AgentOutput, ToolInput, agent, tool};
+use colored::Colorize;
+use serde::{Deserialize, Serialize};
+use serde_json::Value;
+use std::sync::Arc;
+use tokio_stream::StreamExt;
+
+#[derive(Serialize, Deserialize, ToolInput, Debug)]
+pub struct AdditionArgs {
+    #[input(description = "Left Operand for addition")]
+    left: i64,
+    #[input(description = "Right Operand for addition")]
+    right: i64,
+}
+
+#[tool(
+    name = "Addition",
+    description = "Use this tool to Add two numbers",
+    input = AdditionArgs,
+)]
+struct Addition {}
+
+#[async_trait]
+impl ToolRuntime for Addition {
+    async fn execute(&self, args: Value) -> Result<Value, ToolCallError> {
+        let typed_args: AdditionArgs = serde_json::from_value(args)?;
+        let result = typed_args.left + typed_args.right;
+        println!("Tool Call Executed: {}", result);
+        Ok(result.into())
+    }
+}
+
+#[derive(Deserialize, Serialize, Debug, AgentOutput)]
+pub struct AgentOutput {
+    #[output(description = "The response of the query")]
+    response: String,
+}
+
+impl From<ReActAgentOutput> for AgentOutput {
+    fn from(output: ReActAgentOutput) -> Self {
+        output.parse_or_map(|resp| AgentOutput {
+            response: resp.to_string(),
+        })
+    }
+}
+
+#[agent(
+    name = "streaming_agent",
+    description = "You are a Math agent and can solve problems in addition",
+    tools = [Addition]
+    output = AgentOutput
+)]
+#[derive(Clone, AgentHooks)]
+pub struct StreamingAgent {}
+
+pub async fn run(llm: Arc<dyn LLMProvider>) -> Result<(), Error> {
+    println!("🌊 Agent Streaming Example");
+
+    let sliding_window_memory = Box::new(SlidingWindowMemory::new(10));
+
+    let agent = ReActAgent::new(StreamingAgent {});
+
+    let agent_handle = AgentBuilder::<_, DirectAgent>::new(agent)
+        .llm(llm)
+        .stream(true) // Enable streaming for this agent
+        .memory(sliding_window_memory)
+        .build()
+        .await?;
+
+    let task = Task::new("What is 2 + 2?");
+
+    // Process the stream directly
+    let mut stream = agent_handle.agent.run_stream(task).await?;
+    println!("🔄 Processing stream tokens...\n");
+
+    while let Some(result) = stream.next().await {
+        if let Ok(output) = result {
+            println!(
+                "{}",
+                format!("🌊 Streaming Response: {}", output.response).green()
+            );
+        }
+    }
+
+    println!("\n✅ Streaming example completed!");
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[tokio::test]
+    async fn streaming_addition_tool_executes_expected_result() {
+        let result = Addition {}
+            .execute(json!({"left": 8, "right": 9}))
+            .await
+            .expect("addition should succeed");
+        assert_eq!(result, json!(17));
+    }
+
+    #[test]
+    fn streaming_output_parses_json_and_falls_back_to_raw_response() {
+        let parsed = AgentOutput::from(ReActAgentOutput {
+            response: r#"{"response":"streaming complete"}"#.to_string(),
+            tool_calls: Vec::new(),
+            done: true,
+        });
+        assert_eq!(parsed.response, "streaming complete");
+
+        let fallback = AgentOutput::from(ReActAgentOutput {
+            response: "partial text".to_string(),
+            tool_calls: Vec::new(),
+            done: false,
+        });
+        assert_eq!(fallback.response, "partial text");
+    }
+}

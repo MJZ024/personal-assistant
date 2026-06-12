@@ -1,0 +1,792 @@
+//! X.AI API client implementation for chat and completion functionality.
+//!
+//! This module provides integration with X.AI's models through their API.
+//! It implements chat and completion capabilities using the X.AI API endpoints.
+
+use crate::chat::Tool;
+#[cfg(feature = "xai")]
+use crate::embedding::EmbeddingBuilder;
+use crate::{
+    LLMProvider,
+    chat::{ChatMessage, ChatProvider, ChatRole, StructuredOutputFormat},
+    completion::{CompletionProvider, CompletionRequest, CompletionResponse},
+    embedding::EmbeddingProvider,
+    error::LLMError,
+    models::ModelsProvider,
+};
+use crate::{ToolCall, builder::LLMBuilder, chat::ChatResponse};
+use async_trait::async_trait;
+use futures::stream::Stream;
+use reqwest::Client;
+use serde::{Deserialize, Serialize};
+use std::sync::Arc;
+
+/// Client for interacting with X.AI's API.
+///
+/// This struct provides methods for making chat and completion requests to X.AI's language models.
+/// It handles authentication, request configuration, and response parsing.
+pub struct XAI {
+    /// API key for authentication with X.AI services
+    pub api_key: String,
+    /// Model identifier to use for requests (e.g. "grok-2-latest")
+    pub model: String,
+    /// Maximum number of tokens to generate in responses
+    pub max_tokens: Option<u32>,
+    /// Temperature parameter for controlling response randomness (0.0 to 1.0)
+    pub temperature: Option<f32>,
+    /// Request timeout duration in seconds
+    pub timeout_seconds: Option<u64>,
+    /// Top-p sampling parameter for controlling response diversity
+    pub top_p: Option<f32>,
+    /// Top-k sampling parameter for controlling response diversity
+    pub top_k: Option<u32>,
+    /// Embedding encoding format
+    pub embedding_encoding_format: Option<String>,
+    /// Embedding dimensions
+    pub embedding_dimensions: Option<u32>,
+    /// XAI search parameters
+    pub xai_search_mode: Option<String>,
+    /// XAI search sources
+    pub xai_search_source_type: Option<String>,
+    /// XAI search excluded websites
+    pub xai_search_excluded_websites: Option<Vec<String>>,
+    /// XAI search max results
+    pub xai_search_max_results: Option<u32>,
+    /// XAI search from date
+    pub xai_search_from_date: Option<String>,
+    /// XAI search to date
+    pub xai_search_to_date: Option<String>,
+    /// HTTP client for making API requests
+    client: Client,
+}
+
+/// Search source configuration for search parameters
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct XaiSearchSource {
+    /// Type of source: "web" or "news"
+    #[serde(rename = "type")]
+    pub source_type: String,
+    /// List of websites to exclude from this source
+    pub excluded_websites: Option<Vec<String>>,
+}
+
+/// Search parameters for LLM providers that support search functionality
+#[derive(Debug, Clone, Default, serde::Serialize)]
+pub struct XaiSearchParameters {
+    /// Search mode (e.g., "auto")
+    pub mode: Option<String>,
+    /// List of search sources with exclusions
+    pub sources: Option<Vec<XaiSearchSource>>,
+    /// Maximum number of search results to return
+    pub max_search_results: Option<u32>,
+    /// Start date for search results (format: "YYYY-MM-DD")
+    pub from_date: Option<String>,
+    /// End date for search results (format: "YYYY-MM-DD")
+    pub to_date: Option<String>,
+}
+
+/// Individual message in an X.AI chat conversation.
+#[derive(Serialize)]
+struct XAIChatMessage<'a> {
+    /// Role of the message sender (user, assistant, or system)
+    role: &'a str,
+    /// Content of the message
+    content: &'a str,
+}
+
+/// Request payload for X.AI's chat API endpoint.
+#[derive(Serialize)]
+struct XAIChatRequest<'a> {
+    /// Model identifier to use
+    model: &'a str,
+    /// Array of conversation messages
+    messages: Vec<XAIChatMessage<'a>>,
+    /// Maximum tokens to generate
+    #[serde(skip_serializing_if = "Option::is_none")]
+    max_tokens: Option<u32>,
+    /// Temperature parameter
+    #[serde(skip_serializing_if = "Option::is_none")]
+    temperature: Option<f32>,
+    /// Whether to stream the response
+    stream: bool,
+    /// Top-p sampling parameter
+    #[serde(skip_serializing_if = "Option::is_none")]
+    top_p: Option<f32>,
+    /// Top-k sampling parameter
+    #[serde(skip_serializing_if = "Option::is_none")]
+    top_k: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    response_format: Option<XAIResponseFormat>,
+    /// Search parameters for search functionality
+    #[serde(skip_serializing_if = "Option::is_none")]
+    search_parameters: Option<&'a XaiSearchParameters>,
+}
+
+/// Response from X.AI's chat API endpoint.
+#[derive(Deserialize, Debug)]
+struct XAIChatResponse {
+    /// Array of generated responses
+    choices: Vec<XAIChatChoice>,
+}
+
+impl std::fmt::Display for XAIChatResponse {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.text().unwrap_or_default())
+    }
+}
+
+impl ChatResponse for XAIChatResponse {
+    fn text(&self) -> Option<String> {
+        self.choices.first().map(|c| c.message.content.clone())
+    }
+
+    fn tool_calls(&self) -> Option<Vec<ToolCall>> {
+        None
+    }
+}
+
+/// Individual response choice from the chat API.
+#[derive(Deserialize, Debug)]
+struct XAIChatChoice {
+    /// Message content and metadata
+    message: XAIChatMsg,
+}
+
+/// Message content from a chat response.
+#[derive(Deserialize, Debug)]
+struct XAIChatMsg {
+    /// Generated text content
+    content: String,
+}
+
+#[derive(Debug, Serialize)]
+struct XAIEmbeddingRequest<'a> {
+    model: &'a str,
+    input: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    encoding_format: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    dimensions: Option<u32>,
+}
+
+#[derive(Deserialize)]
+struct XAIEmbeddingData {
+    embedding: Vec<f32>,
+}
+
+/// Response from X.AI's streaming chat API endpoint.
+#[derive(Deserialize, Debug)]
+struct XAIStreamResponse {
+    /// Array of generated responses
+    choices: Vec<XAIStreamChoice>,
+}
+
+/// Individual response choice from the streaming chat API.
+#[derive(Deserialize, Debug)]
+struct XAIStreamChoice {
+    /// Delta content
+    delta: XAIStreamDelta,
+}
+
+/// Delta content from a streaming chat response.
+#[derive(Deserialize, Debug)]
+struct XAIStreamDelta {
+    /// Generated text content
+    content: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct XAIEmbeddingResponse {
+    data: Vec<XAIEmbeddingData>,
+}
+
+#[derive(Deserialize, Debug, Serialize)]
+enum XAIResponseType {
+    #[serde(rename = "text")]
+    Text,
+    #[serde(rename = "json_schema")]
+    JsonSchema,
+    #[serde(rename = "json_object")]
+    JsonObject,
+}
+
+/// An object specifying the format that the model must output.
+/// Setting to `{ "type": "json_schema", "json_schema": {...} }` enables Structured Outputs which ensures the model will match your supplied JSON schema. Learn more in the [Structured Outputs guide](https://platform.openai.com/docs/guides/structured-outputs).
+/// Setting to `{ "type": "json_object" }` enables the older JSON mode, which ensures the message the model generates is valid JSON. Using `json_schema` is preferred for models that support it.
+/// The structured outputs feature is only supported for the `grok-2-latest` model.
+#[derive(Deserialize, Debug, Serialize)]
+struct XAIResponseFormat {
+    #[serde(rename = "type")]
+    response_type: XAIResponseType,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    json_schema: Option<StructuredOutputFormat>,
+}
+
+impl XAI {
+    /// Creates a new X.AI client with the specified configuration.
+    ///
+    /// # Arguments
+    ///
+    /// * `api_key` - Authentication key for X.AI API access
+    /// * `model` - Model identifier (defaults to "grok-2-latest" if None)
+    /// * `max_tokens` - Maximum number of tokens to generate in responses
+    /// * `temperature` - Sampling temperature for controlling randomness
+    /// * `timeout_seconds` - Request timeout duration in seconds
+    /// * `system` - System prompt for providing context
+    /// * `stream` - Whether to enable streaming responses
+    /// * `top_p` - Top-p sampling parameter
+    /// * `top_k` - Top-k sampling parameter
+    /// * `json_schema` - JSON schema for structured output
+    /// * `search_parameters` - Search parameters for search functionality
+    ///
+    /// # Returns
+    ///
+    /// A configured X.AI client instance ready to make API requests.
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        api_key: impl Into<String>,
+        model: Option<String>,
+        max_tokens: Option<u32>,
+        temperature: Option<f32>,
+        timeout_seconds: Option<u64>,
+        top_p: Option<f32>,
+        top_k: Option<u32>,
+        embedding_encoding_format: Option<String>,
+        embedding_dimensions: Option<u32>,
+        xai_search_mode: Option<String>,
+        xai_search_source_type: Option<String>,
+        xai_search_excluded_websites: Option<Vec<String>>,
+        xai_search_max_results: Option<u32>,
+        xai_search_from_date: Option<String>,
+        xai_search_to_date: Option<String>,
+    ) -> Self {
+        let mut builder = Client::builder();
+        if let Some(sec) = timeout_seconds {
+            builder = builder.timeout(std::time::Duration::from_secs(sec));
+        }
+        Self {
+            api_key: api_key.into(),
+            model: model.unwrap_or_else(|| "grok-2-latest".to_string()),
+            max_tokens,
+            temperature,
+            timeout_seconds,
+            top_p,
+            top_k,
+            embedding_encoding_format,
+            embedding_dimensions,
+            xai_search_mode,
+            xai_search_source_type,
+            xai_search_excluded_websites,
+            xai_search_max_results,
+            xai_search_from_date,
+            xai_search_to_date,
+            client: builder.build().expect("Failed to build reqwest Client"),
+        }
+    }
+
+    fn build_chat_messages<'a>(messages: &'a [ChatMessage]) -> Vec<XAIChatMessage<'a>> {
+        messages
+            .iter()
+            .map(|m| XAIChatMessage {
+                role: match m.role {
+                    ChatRole::User => "user",
+                    ChatRole::Assistant => "assistant",
+                    ChatRole::System => "system",
+                    ChatRole::Tool => "user",
+                },
+                content: &m.content,
+            })
+            .collect()
+    }
+
+    fn build_search_parameters(&self) -> XaiSearchParameters {
+        XaiSearchParameters {
+            mode: self.xai_search_mode.clone(),
+            sources: Some(vec![XaiSearchSource {
+                source_type: self
+                    .xai_search_source_type
+                    .clone()
+                    .unwrap_or_else(|| "web".to_string()),
+                excluded_websites: self.xai_search_excluded_websites.clone(),
+            }]),
+            max_search_results: self.xai_search_max_results,
+            from_date: self.xai_search_from_date.clone(),
+            to_date: self.xai_search_to_date.clone(),
+        }
+    }
+
+    /// Sets the search mode for search-enabled providers.
+    pub fn set_search_mode(mut self, mode: impl Into<String>) -> Self {
+        self.xai_search_mode = Some(mode.into());
+        self
+    }
+
+    /// Adds a search source with optional excluded websites.
+    pub fn set_search_source(
+        mut self,
+        source_type: impl Into<String>,
+        excluded_websites: Option<Vec<String>>,
+    ) -> Self {
+        self.xai_search_source_type = Some(source_type.into());
+        self.xai_search_excluded_websites = excluded_websites;
+        self
+    }
+
+    /// Sets the maximum number of search results.
+    pub fn set_max_search_results(mut self, max: u32) -> Self {
+        self.xai_search_max_results = Some(max);
+        self
+    }
+
+    /// Sets the date range for search results.
+    pub fn set_search_date_range(mut self, from: impl Into<String>, to: impl Into<String>) -> Self {
+        self.xai_search_from_date = Some(from.into());
+        self.xai_search_to_date = Some(to.into());
+        self
+    }
+
+    /// Sets the start date for search results (format: "YYYY-MM-DD").
+    pub fn set_search_from_date(mut self, date: impl Into<String>) -> Self {
+        self.xai_search_from_date = Some(date.into());
+        self
+    }
+
+    /// Sets the end date for search results (format: "YYYY-MM-DD").
+    pub fn set_search_to_date(mut self, date: impl Into<String>) -> Self {
+        self.xai_search_to_date = Some(date.into());
+        self
+    }
+}
+
+#[async_trait]
+impl ChatProvider for XAI {
+    /// Sends a chat request to the X.AI API and returns the response.
+    ///
+    /// # Arguments
+    ///
+    /// * `messages` - Array of chat messages representing the conversation
+    ///
+    /// # Returns
+    ///
+    /// The generated response text, or an error if the request fails.
+    async fn chat(
+        &self,
+        messages: &[ChatMessage],
+        json_schema: Option<StructuredOutputFormat>,
+    ) -> Result<Box<dyn ChatResponse>, LLMError> {
+        if self.api_key.is_empty() {
+            return Err(LLMError::AuthError("Missing X.AI API key".to_string()));
+        }
+
+        let xai_msgs = XAI::build_chat_messages(messages);
+
+        // OpenAI's structured output has some [odd requirements](https://platform.openai.com/docs/guides/structured-outputs?api-mode=chat&lang=curl#supported-schemas).
+        // There's currently no check for these, so we'll leave it up to the user to provide a valid schema.
+        // Unknown if XAI requires these too, but since it copies everything else from OpenAI, it's likely.
+        let response_format: Option<XAIResponseFormat> =
+            json_schema.as_ref().map(|s| XAIResponseFormat {
+                response_type: XAIResponseType::JsonSchema,
+                json_schema: Some(s.clone()),
+            });
+
+        let search_parameters = self.build_search_parameters();
+
+        let body = XAIChatRequest {
+            model: &self.model,
+            messages: xai_msgs,
+            max_tokens: self.max_tokens,
+            temperature: self.temperature,
+            stream: false,
+            top_p: self.top_p,
+            top_k: self.top_k,
+            response_format,
+            search_parameters: Some(&search_parameters),
+        };
+
+        if log::log_enabled!(log::Level::Trace)
+            && let Ok(json) = serde_json::to_string(&body)
+        {
+            log::trace!("XAI request payload: {json}");
+        }
+
+        let mut request = self
+            .client
+            .post("https://api.x.ai/v1/chat/completions")
+            .bearer_auth(&self.api_key)
+            .json(&body);
+
+        if let Some(timeout) = self.timeout_seconds {
+            request = request.timeout(std::time::Duration::from_secs(timeout));
+        }
+
+        let resp = request.send().await?;
+
+        log::debug!("XAI HTTP status: {}", resp.status());
+
+        let resp = resp.error_for_status()?;
+
+        let json_resp: XAIChatResponse = resp.json().await?;
+        Ok(Box::new(json_resp))
+    }
+
+    /// Sends a streaming chat request to X.AI's API.
+    ///
+    /// # Arguments
+    ///
+    /// * `messages` - Slice of chat messages representing the conversation
+    ///
+    /// # Returns
+    ///
+    /// A stream of text tokens or an error
+    async fn chat_stream(
+        &self,
+        messages: &[ChatMessage],
+        _json_schema: Option<StructuredOutputFormat>,
+    ) -> Result<std::pin::Pin<Box<dyn Stream<Item = Result<String, LLMError>> + Send>>, LLMError>
+    {
+        if self.api_key.is_empty() {
+            return Err(LLMError::AuthError("Missing X.AI API key".to_string()));
+        }
+
+        let xai_msgs: Vec<XAIChatMessage> = messages
+            .iter()
+            .map(|m| XAIChatMessage {
+                role: match m.role {
+                    ChatRole::User => "user",
+                    ChatRole::Assistant => "assistant",
+                    ChatRole::System => "system",
+                    ChatRole::Tool => "user",
+                },
+                content: &m.content,
+            })
+            .collect();
+
+        let body = XAIChatRequest {
+            model: &self.model,
+            messages: xai_msgs,
+            max_tokens: self.max_tokens,
+            temperature: self.temperature,
+            stream: true,
+            top_p: self.top_p,
+            top_k: self.top_k,
+            response_format: None,
+            search_parameters: None,
+        };
+
+        let mut request = self
+            .client
+            .post("https://api.x.ai/v1/chat/completions")
+            .bearer_auth(&self.api_key)
+            .json(&body);
+
+        if let Some(timeout) = self.timeout_seconds {
+            request = request.timeout(std::time::Duration::from_secs(timeout));
+        }
+
+        let response = request.send().await?;
+
+        if !response.status().is_success() {
+            let status = response.status();
+            let error_text = response.text().await?;
+            return Err(LLMError::ResponseFormatError {
+                message: format!("X.AI API returned error status: {status}"),
+                raw_response: error_text,
+            });
+        }
+
+        Ok(crate::chat::create_sse_stream(
+            response,
+            parse_xai_sse_chunk,
+        ))
+    }
+
+    async fn chat_with_tools(
+        &self,
+        _messages: &[ChatMessage],
+        _tools: Option<&[Tool]>,
+        _json_schema: Option<StructuredOutputFormat>,
+    ) -> Result<Box<dyn ChatResponse>, LLMError> {
+        unimplemented!("XAI Doesn't support tools yet")
+    }
+
+    fn model(&self) -> &str {
+        &self.model
+    }
+}
+
+#[async_trait]
+impl CompletionProvider for XAI {
+    /// Sends a completion request to X.AI's API.
+    ///
+    /// This functionality is currently not implemented.
+    ///
+    /// # Arguments
+    ///
+    /// * `_req` - The completion request parameters
+    ///
+    /// # Returns
+    ///
+    /// A placeholder response indicating the functionality is not implemented.
+    async fn complete(
+        &self,
+        _req: &CompletionRequest,
+        _json_schema: Option<StructuredOutputFormat>,
+    ) -> Result<CompletionResponse, LLMError> {
+        if self.api_key.is_empty() {
+            return Err(LLMError::AuthError("Missing X.AI API key".into()));
+        }
+        Err(LLMError::ProviderError(
+            "X.AI completion not implemented yet".into(),
+        ))
+    }
+}
+
+#[async_trait]
+impl EmbeddingProvider for XAI {
+    async fn embed(&self, text: Vec<String>) -> Result<Vec<Vec<f32>>, LLMError> {
+        if self.api_key.is_empty() {
+            return Err(LLMError::AuthError("Missing X.AI API key".into()));
+        }
+
+        let emb_format = self
+            .embedding_encoding_format
+            .clone()
+            .unwrap_or_else(|| "float".to_string());
+
+        let body = XAIEmbeddingRequest {
+            model: &self.model,
+            input: text,
+            encoding_format: Some(&emb_format),
+            dimensions: self.embedding_dimensions,
+        };
+
+        let resp = self
+            .client
+            .post("https://api.x.ai/v1/embeddings")
+            .bearer_auth(&self.api_key)
+            .json(&body)
+            .send()
+            .await?
+            .error_for_status()?;
+
+        let json_resp: XAIEmbeddingResponse = resp.json().await?;
+
+        let embeddings = json_resp.data.into_iter().map(|d| d.embedding).collect();
+        Ok(embeddings)
+    }
+}
+
+#[async_trait]
+impl ModelsProvider for XAI {
+    async fn list_models(
+        &self,
+        _request: Option<&crate::models::ModelListRequest>,
+    ) -> Result<Box<dyn crate::models::ModelListResponse>, LLMError> {
+        if self.api_key.is_empty() {
+            return Err(LLMError::AuthError("Missing X.AI API key".into()));
+        }
+        Err(LLMError::ProviderError("List Models not supported".into()))
+    }
+}
+
+impl LLMProvider for XAI {}
+
+impl crate::HasConfig for XAI {
+    type Config = crate::NoConfig;
+}
+
+/// Parses a Server-Sent Events (SSE) chunk from X.AI's streaming API.
+///
+/// # Arguments
+///
+/// * `chunk` - The raw SSE chunk text
+///
+/// # Returns
+///
+/// * `Ok(Some(String))` - Content token if found
+/// * `Ok(None)` - If chunk should be skipped (e.g., ping, done signal)
+/// * `Err(LLMError)` - If parsing fails
+fn parse_xai_sse_chunk(chunk: &str) -> Result<Option<String>, LLMError> {
+    for line in chunk.lines() {
+        let line = line.trim();
+
+        if let Some(data) = line.strip_prefix("data: ") {
+            if data == "[DONE]" {
+                return Ok(None);
+            }
+
+            match serde_json::from_str::<XAIStreamResponse>(data) {
+                Ok(response) => {
+                    if let Some(choice) = response.choices.first()
+                        && let Some(content) = &choice.delta.content
+                    {
+                        return Ok(Some(content.clone()));
+                    }
+                    return Ok(None);
+                }
+                Err(_) => continue,
+            }
+        }
+    }
+
+    Ok(None)
+}
+
+impl LLMBuilder<XAI> {
+    pub fn build(self) -> Result<Arc<XAI>, LLMError> {
+        let api_key = self
+            .api_key
+            .ok_or_else(|| LLMError::InvalidRequest("No API key provided for XAI".to_string()))?;
+
+        let xai = XAI::new(
+            api_key,
+            self.model,
+            self.max_tokens,
+            self.temperature,
+            self.timeout_seconds,
+            self.top_p,
+            self.top_k,
+            self.embedding_encoding_format,
+            self.embedding_dimensions,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        );
+
+        Ok(Arc::new(xai))
+    }
+}
+
+impl EmbeddingBuilder<XAI> {
+    /// Build an XAI embedding provider.
+    pub fn build(self) -> Result<Arc<XAI>, LLMError> {
+        let api_key = self
+            .api_key
+            .ok_or_else(|| LLMError::InvalidRequest("No API key provided for XAI".to_string()))?;
+
+        let provider = XAI::new(
+            api_key,
+            Some(self.model.unwrap_or_else(|| "grok-2-latest".to_string())),
+            None,
+            None,
+            self.timeout_seconds,
+            None,
+            None,
+            self.embedding_encoding_format,
+            self.embedding_dimensions,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        );
+
+        Ok(Arc::new(provider))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn test_xai_search_parameters_serialization() {
+        let params = XaiSearchParameters {
+            mode: Some("auto".to_string()),
+            sources: Some(vec![XaiSearchSource {
+                source_type: "web".to_string(),
+                excluded_websites: Some(vec!["example.com".to_string()]),
+            }]),
+            max_search_results: Some(5),
+            from_date: Some("2024-01-01".to_string()),
+            to_date: Some("2024-01-31".to_string()),
+        };
+        let serialized = serde_json::to_value(&params).unwrap();
+        assert_eq!(serialized.get("mode"), Some(&json!("auto")));
+        assert_eq!(serialized.get("max_search_results"), Some(&json!(5)));
+    }
+
+    #[test]
+    fn test_xai_embedding_request_serialization() {
+        let req = XAIEmbeddingRequest {
+            model: "embed",
+            input: vec!["a".to_string()],
+            encoding_format: Some("float"),
+            dimensions: Some(3),
+        };
+        let serialized = serde_json::to_value(&req).unwrap();
+        assert_eq!(serialized.get("model"), Some(&json!("embed")));
+        assert_eq!(
+            serialized
+                .get("input")
+                .and_then(|v| v.as_array())
+                .unwrap()
+                .len(),
+            1
+        );
+    }
+
+    #[test]
+    fn test_parse_xai_sse_chunk_extracts_content() {
+        let chunk = r#"data: {"choices":[{"delta":{"content":"hi"}}]}"#;
+        let parsed = parse_xai_sse_chunk(chunk).unwrap();
+        assert_eq!(parsed.as_deref(), Some("hi"));
+    }
+
+    #[test]
+    fn test_parse_xai_sse_chunk_done() {
+        let chunk = "data: [DONE]";
+        let parsed = parse_xai_sse_chunk(chunk).unwrap();
+        assert!(parsed.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_list_models_missing_key() {
+        let client = XAI::new(
+            "", None, None, None, None, None, None, None, None, None, None, None, None, None, None,
+        );
+        let err = client.list_models(None).await.unwrap_err();
+        assert!(err.to_string().contains("Missing X.AI API key"));
+    }
+
+    #[test]
+    fn test_builder_requires_api_key() {
+        let result = LLMBuilder::<XAI>::new().build();
+        assert!(result.is_err());
+        let err = result.err().unwrap();
+        assert!(err.to_string().contains("No API key provided for XAI"));
+    }
+
+    #[test]
+    fn test_build_chat_messages_maps_roles() {
+        let messages = vec![
+            crate::chat::ChatMessageBuilder::new(ChatRole::System)
+                .content("sys")
+                .build(),
+            ChatMessage::user().content("user").build(),
+            ChatMessage::assistant().content("asst").build(),
+        ];
+        let built = XAI::build_chat_messages(&messages);
+        assert_eq!(built.len(), 3);
+        assert_eq!(built[0].role, "system");
+        assert_eq!(built[1].role, "user");
+        assert_eq!(built[2].role, "assistant");
+    }
+
+    #[test]
+    fn test_build_search_parameters_defaults() {
+        let xai = XAI::new(
+            "key", None, None, None, None, None, None, None, None, None, None, None, None, None,
+            None,
+        );
+        let params = xai.build_search_parameters();
+        let source = params.sources.unwrap().pop().unwrap();
+        assert_eq!(source.source_type, "web");
+        assert!(source.excluded_websites.is_none());
+    }
+}

@@ -1,0 +1,59 @@
+name: Coverage
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - "crates/**"
+      - "Cargo.toml"
+      - "Makefile"
+      - ".github/workflows/coverage.yml"
+  pull_request:
+    paths:
+      - "crates/**"
+      - "Cargo.toml"
+      - "Makefile"
+      - ".github/workflows/coverage.yml"
+
+jobs:
+  coverage:
+    name: Rust Coverage
+    permissions:
+      contents: read
+      pull-requests: write
+    runs-on: ubuntu-latest
+    env:
+      RUSTFLAGS: "-C target-cpu=native"
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libasound2-dev pkg-config
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: llvm-tools-preview
+
+      - name: Show CPU info
+        run: lscpu
+
+      - name: Install Tarpaulin
+        run: cargo install cargo-tarpaulin
+
+      - name: Generate Rust coverage
+        run: make coverage-rust
+
+      - name: Upload to Codecov
+        uses: codecov/codecov-action@v5
+        with:
+          token: ${{ secrets.CODECOV_TOKEN }}
+          verbose: true
+          fail_ci_if_error: true
+          files: ./target/tarpaulin-workspace/cobertura.xml
+          branch: ${{ github.ref_name }} # branch name
+          pr: ${{ github.event.pull_request.number || '' }} # PR number if exists

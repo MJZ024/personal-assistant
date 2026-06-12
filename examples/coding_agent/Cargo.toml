@@ -1,0 +1,23 @@
+[package]
+name = "coding_agent"
+version = "0.2.0-alpha.0"
+edition.workspace = true
+publish = false
+
+[dependencies]
+autoagents-derive = { workspace = true }
+autoagents-toolkit = { workspace = true, features = ["filesystem"] }
+autoagents = { workspace = true, features = [
+    "openai",
+    "anthropic",
+] }
+tokio = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+clap = { workspace = true }
+tokio-stream.workspace = true
+regex = { workspace = true }
+walkdir = { workspace = true }
+glob = { workspace = true }
+termimad = "0.33.0"
+colored = "3.0.0"

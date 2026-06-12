@@ -1,0 +1,951 @@
+//! Azure OpenAI API client implementation for chat and completion functionality.
+//!
+//! This module provides integration with Azure OpenAI's GPT models through their API.
+
+use std::sync::Arc;
+
+use crate::{
+    FunctionCall, ToolCall,
+    builder::LLMBuilder,
+    chat::{ChatResponse, ToolChoice},
+    embedding::EmbeddingBuilder,
+};
+#[cfg(feature = "azure_openai")]
+use crate::{
+    LLMProvider,
+    chat::Tool,
+    chat::{ChatMessage, ChatProvider, ChatRole, MessageType, StructuredOutputFormat},
+    completion::{CompletionProvider, CompletionRequest, CompletionResponse},
+    embedding::EmbeddingProvider,
+    error::LLMError,
+    models::ModelsProvider,
+};
+use async_trait::async_trait;
+use either::*;
+use reqwest::{Client, Url};
+use serde::{Deserialize, Serialize};
+
+/// Client for interacting with Azure OpenAI's API.
+///
+/// Provides methods for chat and completion requests using Azure OpenAI's models.
+pub struct AzureOpenAI {
+    pub api_key: String,
+    pub api_version: String,
+    pub base_url: Url,
+    pub model: String,
+    pub max_tokens: Option<u32>,
+    pub temperature: Option<f32>,
+    pub timeout_seconds: Option<u64>,
+    pub top_p: Option<f32>,
+    pub top_k: Option<u32>,
+    pub tool_choice: Option<ToolChoice>,
+    /// Embedding parameters
+    pub embedding_encoding_format: Option<String>,
+    pub embedding_dimensions: Option<u32>,
+    pub reasoning_effort: Option<String>,
+    client: Client,
+}
+
+/// Individual message in an OpenAI chat conversation.
+#[derive(Serialize, Debug)]
+struct AzureOpenAIChatMessage<'a> {
+    #[allow(dead_code)]
+    role: &'a str,
+    #[serde(
+        skip_serializing_if = "Option::is_none",
+        with = "either::serde_untagged_optional"
+    )]
+    content: Option<Either<Vec<AzureMessageContent<'a>>, String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tool_calls: Option<Vec<AzureOpenAIToolCall<'a>>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tool_call_id: Option<String>,
+}
+
+impl<'a> From<&'a ChatMessage> for AzureOpenAIChatMessage<'a> {
+    fn from(chat_msg: &'a ChatMessage) -> Self {
+        Self {
+            role: match chat_msg.role {
+                ChatRole::User => "user",
+                ChatRole::System => "system",
+                ChatRole::Assistant => "assistant",
+                ChatRole::Tool => "user",
+            },
+            tool_call_id: None,
+            content: match &chat_msg.message_type {
+                MessageType::Text => Some(Right(chat_msg.content.clone())),
+                // Image case is handled separately above
+                MessageType::Image(_) => unreachable!(),
+                MessageType::Pdf(_) => unimplemented!(),
+                MessageType::ImageURL(url) => {
+                    // Clone the URL to create an owned version
+
+                    Some(Left(vec![AzureMessageContent {
+                        message_type: Some("image_url"),
+                        text: None,
+                        image_url: Some(ImageUrlContent { url }),
+                        tool_output: None,
+                        tool_call_id: None,
+                    }]))
+                }
+                MessageType::ToolUse(_) => None,
+                MessageType::ToolResult(_) => None,
+            },
+            tool_calls: match &chat_msg.message_type {
+                MessageType::ToolUse(calls) => {
+                    let owned_calls: Vec<AzureOpenAIToolCall> =
+                        calls.iter().map(|c| c.into()).collect();
+                    Some(owned_calls)
+                }
+                _ => None,
+            },
+        }
+    }
+}
+
+#[derive(Serialize, Debug)]
+struct AzureOpenAIFunctionCall<'a> {
+    name: &'a str,
+    arguments: &'a str,
+}
+
+impl<'a> From<&'a FunctionCall> for AzureOpenAIFunctionCall<'a> {
+    fn from(value: &'a FunctionCall) -> Self {
+        Self {
+            name: &value.name,
+            arguments: &value.arguments,
+        }
+    }
+}
+
+#[derive(Serialize, Debug)]
+struct AzureOpenAIToolCall<'a> {
+    id: &'a str,
+    #[serde(rename = "type")]
+    content_type: &'a str,
+    function: AzureOpenAIFunctionCall<'a>,
+}
+
+impl<'a> From<&'a ToolCall> for AzureOpenAIToolCall<'a> {
+    fn from(value: &'a ToolCall) -> Self {
+        Self {
+            id: &value.id,
+            content_type: "function",
+            function: AzureOpenAIFunctionCall::from(&value.function),
+        }
+    }
+}
+
+#[derive(Serialize, Debug)]
+struct AzureMessageContent<'a> {
+    #[serde(rename = "type", skip_serializing_if = "Option::is_none")]
+    message_type: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    text: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    image_url: Option<ImageUrlContent<'a>>,
+    #[serde(skip_serializing_if = "Option::is_none", rename = "tool_call_id")]
+    tool_call_id: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none", rename = "content")]
+    tool_output: Option<&'a str>,
+}
+
+/// Individual image message in an OpenAI chat conversation.
+#[derive(Serialize, Debug)]
+struct ImageUrlContent<'a> {
+    url: &'a str,
+}
+
+#[derive(Serialize)]
+struct OpenAIEmbeddingRequest {
+    model: String,
+    input: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    encoding_format: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    dimensions: Option<u32>,
+}
+
+/// Request payload for Azure OpenAI's chat API endpoint.
+#[derive(Serialize, Debug)]
+struct AzureOpenAIChatRequest<'a> {
+    model: &'a str,
+    messages: Vec<AzureOpenAIChatMessage<'a>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    max_tokens: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    temperature: Option<f32>,
+    stream: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    top_p: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    top_k: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tools: Option<Vec<Tool>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tool_choice: Option<ToolChoice>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reasoning_effort: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    response_format: Option<OpenAIResponseFormat>,
+}
+
+/// Response from OpenAI's chat API endpoint.
+#[derive(Deserialize, Debug)]
+struct AzureOpenAIChatResponse {
+    choices: Vec<AzureOpenAIChatChoice>,
+}
+
+/// Individual choice within an OpenAI chat API response.
+#[derive(Deserialize, Debug)]
+struct AzureOpenAIChatChoice {
+    message: AzureOpenAIChatMsg,
+}
+
+/// Message content within an OpenAI chat API response.
+#[derive(Deserialize, Debug)]
+struct AzureOpenAIChatMsg {
+    #[allow(dead_code)]
+    role: String,
+    content: Option<String>,
+    tool_calls: Option<Vec<ToolCall>>,
+}
+
+#[derive(Deserialize, Debug)]
+struct AzureOpenAIEmbeddingData {
+    embedding: Vec<f32>,
+}
+#[derive(Deserialize, Debug)]
+struct OpenAIEmbeddingResponse {
+    data: Vec<AzureOpenAIEmbeddingData>,
+}
+
+/// An object specifying the format that the model must output.
+///Setting to `{ "type": "json_schema", "json_schema": {...} }` enables Structured Outputs which ensures the model will match your supplied JSON schema. Learn more in the [Structured Outputs guide](https://platform.openai.com/docs/guides/structured-outputs).
+/// Setting to `{ "type": "json_object" }` enables the older JSON mode, which ensures the message the model generates is valid JSON. Using `json_schema` is preferred for models that support it.
+#[derive(Deserialize, Debug, Serialize)]
+enum OpenAIResponseType {
+    #[serde(rename = "text")]
+    Text,
+    #[serde(rename = "json_schema")]
+    JsonSchema,
+    #[serde(rename = "json_object")]
+    JsonObject,
+}
+
+#[derive(Deserialize, Debug, Serialize)]
+struct OpenAIResponseFormat {
+    #[serde(rename = "type")]
+    response_type: OpenAIResponseType,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    json_schema: Option<StructuredOutputFormat>,
+}
+
+impl From<StructuredOutputFormat> for OpenAIResponseFormat {
+    /// Modify the schema to ensure that it meets OpenAI's requirements.
+    fn from(structured_response_format: StructuredOutputFormat) -> Self {
+        // It's possible to pass a StructuredOutputJsonSchema without an actual schema.
+        // In this case, just pass the StructuredOutputJsonSchema object without modifying it.
+        match structured_response_format.schema {
+            None => OpenAIResponseFormat {
+                response_type: OpenAIResponseType::JsonSchema,
+                json_schema: Some(structured_response_format),
+            },
+            Some(mut schema) => {
+                // Although [OpenAI's specifications](https://platform.openai.com/docs/guides/structured-outputs?api-mode=chat#additionalproperties-false-must-always-be-set-in-objects) say that the "additionalProperties" field is required, my testing shows that it is not.
+                // Just to be safe, add it to the schema if it is missing.
+                schema = if schema.get("additionalProperties").is_none() {
+                    schema["additionalProperties"] = serde_json::json!(false);
+                    schema
+                } else {
+                    schema
+                };
+
+                OpenAIResponseFormat {
+                    response_type: OpenAIResponseType::JsonSchema,
+                    json_schema: Some(StructuredOutputFormat {
+                        name: structured_response_format.name,
+                        description: structured_response_format.description,
+                        schema: Some(schema),
+                        strict: structured_response_format.strict,
+                    }),
+                }
+            }
+        }
+    }
+}
+
+impl ChatResponse for AzureOpenAIChatResponse {
+    fn text(&self) -> Option<String> {
+        self.choices.first().and_then(|c| c.message.content.clone())
+    }
+
+    fn tool_calls(&self) -> Option<Vec<ToolCall>> {
+        self.choices
+            .first()
+            .and_then(|c| c.message.tool_calls.clone())
+    }
+}
+
+impl std::fmt::Display for AzureOpenAIChatResponse {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match (
+            &self.choices.first().unwrap().message.content,
+            &self.choices.first().unwrap().message.tool_calls,
+        ) {
+            (Some(content), Some(tool_calls)) => {
+                for tool_call in tool_calls {
+                    write!(f, "{tool_call}")?;
+                }
+                write!(f, "{content}")
+            }
+            (Some(content), None) => write!(f, "{content}"),
+            (None, Some(tool_calls)) => {
+                for tool_call in tool_calls {
+                    write!(f, "{tool_call}")?;
+                }
+                Ok(())
+            }
+            (None, None) => write!(f, ""),
+        }
+    }
+}
+
+impl AzureOpenAI {
+    /// Creates a new OpenAI client with the specified configuration.
+    ///
+    /// # Arguments
+    ///
+    /// * `api_key` - OpenAI API key
+    /// * `model` - Model to use (defaults to "gpt-3.5-turbo")
+    /// * `max_tokens` - Maximum tokens to generate
+    /// * `temperature` - Sampling temperature
+    /// * `timeout_seconds` - Request timeout in seconds
+    /// * `stream` - Whether to stream responses
+    /// * `top_p` - Top-p sampling parameter
+    /// * `top_k` - Top-k sampling parameter
+    /// * `embedding_encoding_format` - Format for embedding outputs
+    /// * `embedding_dimensions` - Dimensions for embedding vectors
+    /// * `tool_choice` - Determines how the model uses tools
+    /// * `reasoning_effort` - Reasoning effort level
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        api_key: impl Into<String>,
+        api_version: impl Into<String>,
+        deployment_id: impl Into<String>,
+        endpoint: impl Into<String>,
+        model: Option<String>,
+        max_tokens: Option<u32>,
+        temperature: Option<f32>,
+        timeout_seconds: Option<u64>,
+        top_p: Option<f32>,
+        top_k: Option<u32>,
+        embedding_encoding_format: Option<String>,
+        embedding_dimensions: Option<u32>,
+        tool_choice: Option<ToolChoice>,
+        reasoning_effort: Option<String>,
+    ) -> Self {
+        let mut builder = Client::builder();
+        if let Some(sec) = timeout_seconds {
+            builder = builder.timeout(std::time::Duration::from_secs(sec));
+        }
+
+        let endpoint = endpoint.into();
+        let deployment_id = deployment_id.into();
+
+        Self {
+            api_key: api_key.into(),
+            api_version: api_version.into(),
+            base_url: Url::parse(&format!("{endpoint}/openai/deployments/{deployment_id}/"))
+                .expect("Failed to parse base Url"),
+            model: model.unwrap_or_else(|| "gpt-3.5-turbo".to_string()),
+            max_tokens,
+            temperature,
+            timeout_seconds,
+            top_p,
+            top_k,
+            tool_choice,
+            embedding_encoding_format,
+            embedding_dimensions,
+            client: builder.build().expect("Failed to build reqwest Client"),
+            reasoning_effort,
+        }
+    }
+}
+
+#[async_trait]
+impl ChatProvider for AzureOpenAI {
+    /// Sends a chat request to OpenAI's API.
+    ///
+    /// # Arguments
+    ///
+    /// * `messages` - Slice of chat messages representing the conversation
+    /// * `tools` - Optional slice of tools to use in the chat
+    /// # Returns
+    ///
+    /// The model's response text or an error
+    async fn chat_with_tools(
+        &self,
+        messages: &[ChatMessage],
+        tools: Option<&[Tool]>,
+        json_schema: Option<StructuredOutputFormat>,
+    ) -> Result<Box<dyn ChatResponse>, LLMError> {
+        if self.api_key.is_empty() {
+            return Err(LLMError::AuthError(
+                "Missing Azure OpenAI API key".to_string(),
+            ));
+        }
+
+        let mut openai_msgs: Vec<AzureOpenAIChatMessage> = vec![];
+
+        for msg in messages {
+            if let MessageType::ToolResult(ref results) = msg.message_type {
+                for result in results {
+                    openai_msgs.push(
+                        // Clone strings to own them
+                        AzureOpenAIChatMessage {
+                            role: "tool",
+                            tool_call_id: Some(result.id.clone()),
+                            tool_calls: None,
+                            content: Some(Right(result.function.arguments.clone())),
+                        },
+                    );
+                }
+            } else {
+                openai_msgs.push(msg.into())
+            }
+        }
+
+        // Build the response format object
+        let response_format: Option<OpenAIResponseFormat> = json_schema.clone().map(|s| s.into());
+
+        let request_tools = tools.map(|t| t.to_vec());
+        let request_tool_choice = if request_tools.is_some() {
+            self.tool_choice.clone()
+        } else {
+            None
+        };
+
+        let body = AzureOpenAIChatRequest {
+            model: &self.model,
+            messages: openai_msgs,
+            max_tokens: self.max_tokens,
+            temperature: self.temperature,
+            stream: false,
+            top_p: self.top_p,
+            top_k: self.top_k,
+            tools: request_tools,
+            tool_choice: request_tool_choice,
+            reasoning_effort: self.reasoning_effort.clone(),
+            response_format,
+        };
+
+        if log::log_enabled!(log::Level::Trace)
+            && let Ok(json) = serde_json::to_string(&body)
+        {
+            log::trace!("Azure OpenAI request payload: {}", json);
+        }
+
+        let mut url = self
+            .base_url
+            .join("chat/completions")
+            .map_err(|e| LLMError::HttpError(e.to_string()))?;
+
+        url.query_pairs_mut()
+            .append_pair("api-version", &self.api_version);
+
+        let mut request = self
+            .client
+            .post(url)
+            .header("api-key", &self.api_key)
+            .json(&body);
+
+        if let Some(timeout) = self.timeout_seconds {
+            request = request.timeout(std::time::Duration::from_secs(timeout));
+        }
+
+        // Send the request
+        let response = request.send().await?;
+
+        log::debug!("Azure OpenAI HTTP status: {}", response.status());
+
+        // If we got a non-200 response, let's get the error details
+        if !response.status().is_success() {
+            let status = response.status();
+            let error_text = response.text().await?;
+            return Err(LLMError::ResponseFormatError {
+                message: format!("OpenAI API returned error status: {status}"),
+                raw_response: error_text,
+            });
+        }
+
+        // Parse the successful response
+        let resp_text = response.text().await?;
+        let json_resp: Result<AzureOpenAIChatResponse, serde_json::Error> =
+            serde_json::from_str(&resp_text);
+
+        match json_resp {
+            Ok(response) => Ok(Box::new(response)),
+            Err(e) => Err(LLMError::ResponseFormatError {
+                message: format!("Failed to decode Azure OpenAI API response: {e}"),
+                raw_response: resp_text,
+            }),
+        }
+    }
+
+    async fn chat(
+        &self,
+        messages: &[ChatMessage],
+        json_schema: Option<StructuredOutputFormat>,
+    ) -> Result<Box<dyn ChatResponse>, LLMError> {
+        self.chat_with_tools(messages, None, json_schema).await
+    }
+
+    fn model(&self) -> &str {
+        &self.model
+    }
+}
+
+#[async_trait]
+impl CompletionProvider for AzureOpenAI {
+    /// Sends a completion request to OpenAI's API.
+    ///
+    /// Currently not implemented.
+    async fn complete(
+        &self,
+        _req: &CompletionRequest,
+        _json_schema: Option<StructuredOutputFormat>,
+    ) -> Result<CompletionResponse, LLMError> {
+        Ok(CompletionResponse {
+            text: "OpenAI completion not implemented.".into(),
+        })
+    }
+}
+
+impl LLMProvider for AzureOpenAI {}
+
+impl crate::HasConfig for AzureOpenAI {
+    type Config = crate::NoConfig;
+}
+
+#[cfg(feature = "azure_openai")]
+#[async_trait]
+impl EmbeddingProvider for AzureOpenAI {
+    async fn embed(&self, input: Vec<String>) -> Result<Vec<Vec<f32>>, LLMError> {
+        if self.api_key.is_empty() {
+            return Err(LLMError::AuthError("Missing OpenAI API key".into()));
+        }
+
+        let emb_format = self
+            .embedding_encoding_format
+            .clone()
+            .unwrap_or_else(|| "float".to_string());
+
+        let body = OpenAIEmbeddingRequest {
+            model: self.model.clone(),
+            input,
+            encoding_format: Some(emb_format),
+            dimensions: self.embedding_dimensions,
+        };
+
+        let mut url = self
+            .base_url
+            .join("embeddings")
+            .map_err(|e| LLMError::HttpError(e.to_string()))?;
+
+        url.query_pairs_mut()
+            .append_pair("api-version", &self.api_version);
+
+        let resp = self
+            .client
+            .post(url)
+            .header("api-key", &self.api_key)
+            .json(&body)
+            .send()
+            .await?
+            .error_for_status()?;
+
+        let json_resp: OpenAIEmbeddingResponse = resp.json().await?;
+
+        let embeddings = json_resp.data.into_iter().map(|d| d.embedding).collect();
+        Ok(embeddings)
+    }
+}
+
+#[async_trait]
+impl ModelsProvider for AzureOpenAI {}
+
+impl LLMBuilder<AzureOpenAI> {
+    pub fn build(self) -> Result<Arc<AzureOpenAI>, LLMError> {
+        let endpoint = self.base_url.ok_or_else(|| {
+            LLMError::InvalidRequest("No API endpoint provided for Azure OpenAI".into())
+        })?;
+
+        let key = self.api_key.ok_or_else(|| {
+            LLMError::InvalidRequest("No API key provided for Azure OpenAI".to_string())
+        })?;
+
+        let api_version = self.api_version.ok_or_else(|| {
+            LLMError::InvalidRequest("No API version provided for Azure OpenAI".to_string())
+        })?;
+
+        let deployment = self.deployment_id.ok_or_else(|| {
+            LLMError::InvalidRequest("No deployment ID provided for Azure OpenAI".into())
+        })?;
+
+        let provider = AzureOpenAI::new(
+            key,
+            api_version,
+            deployment,
+            endpoint,
+            self.model,
+            self.max_tokens,
+            self.temperature,
+            self.timeout_seconds,
+            self.top_p,
+            self.top_k,
+            self.embedding_encoding_format,
+            self.embedding_dimensions,
+            self.tool_choice,
+            self.reasoning_effort,
+        );
+
+        Ok(Arc::new(provider))
+    }
+}
+
+impl EmbeddingBuilder<AzureOpenAI> {
+    /// Build an Azure OpenAI embedding provider.
+    pub fn build(self) -> Result<Arc<AzureOpenAI>, LLMError> {
+        let api_key = self.api_key.ok_or_else(|| {
+            LLMError::InvalidRequest("No API key provided for Azure OpenAI".to_string())
+        })?;
+        let api_version = self.api_version.ok_or_else(|| {
+            LLMError::InvalidRequest("No API version provided for Azure OpenAI".to_string())
+        })?;
+        let deployment_id = self.deployment_id.ok_or_else(|| {
+            LLMError::InvalidRequest("No deployment ID provided for Azure OpenAI".to_string())
+        })?;
+        let endpoint = self.base_url.ok_or_else(|| {
+            LLMError::InvalidRequest("No API endpoint provided for Azure OpenAI".to_string())
+        })?;
+
+        let provider = AzureOpenAI::new(
+            api_key,
+            api_version,
+            deployment_id,
+            endpoint,
+            Some(
+                self.model
+                    .unwrap_or_else(|| "text-embedding-3-small".to_string()),
+            ),
+            None,
+            None,
+            self.timeout_seconds,
+            None,
+            None,
+            self.embedding_encoding_format,
+            self.embedding_dimensions,
+            None,
+            None,
+        );
+
+        Ok(Arc::new(provider))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::chat::{ChatMessage, ChatRole, MessageType, Tool};
+    use crate::{FunctionCall, ToolCall};
+    use httpmock::{Method::POST, MockServer};
+    use serde_json::json;
+
+    fn sample_tool() -> Tool {
+        Tool {
+            tool_type: "function".to_string(),
+            function: crate::chat::FunctionTool {
+                name: "lookup".to_string(),
+                description: "desc".to_string(),
+                parameters: json!({
+                    "type": "object",
+                    "properties": {
+                        "q": { "type": "string" }
+                    }
+                }),
+            },
+        }
+    }
+
+    #[test]
+    fn test_azure_chat_message_from_text() {
+        let msg = ChatMessage {
+            role: ChatRole::User,
+            message_type: MessageType::Text,
+            content: "hello".to_string(),
+        };
+        let azure = AzureOpenAIChatMessage::from(&msg);
+        assert_eq!(azure.role, "user");
+        assert!(azure.content.is_some());
+        assert!(azure.tool_calls.is_none());
+    }
+
+    #[test]
+    fn test_azure_chat_message_from_image_url() {
+        let msg = ChatMessage {
+            role: ChatRole::User,
+            message_type: MessageType::ImageURL("https://example.com/img.png".to_string()),
+            content: "describe".to_string(),
+        };
+        let azure = AzureOpenAIChatMessage::from(&msg);
+        match azure.content.unwrap() {
+            Right(_) => panic!("Expected multipart content"),
+            Left(parts) => {
+                assert_eq!(parts.len(), 1);
+                assert_eq!(parts[0].message_type, Some("image_url"));
+            }
+        }
+    }
+
+    #[test]
+    fn test_azure_chat_message_from_tool_use() {
+        let msg = ChatMessage {
+            role: ChatRole::Assistant,
+            message_type: MessageType::ToolUse(vec![ToolCall {
+                id: "call_1".to_string(),
+                call_type: "function".to_string(),
+                function: FunctionCall {
+                    name: "lookup".to_string(),
+                    arguments: "{\"q\":\"value\"}".to_string(),
+                },
+            }]),
+            content: "tool use".to_string(),
+        };
+        let azure = AzureOpenAIChatMessage::from(&msg);
+        assert!(azure.content.is_none());
+        assert!(azure.tool_calls.is_some());
+    }
+
+    #[test]
+    fn test_azure_tool_call_from_tool_call() {
+        let call = ToolCall {
+            id: "call_1".to_string(),
+            call_type: "function".to_string(),
+            function: FunctionCall {
+                name: "lookup".to_string(),
+                arguments: "{\"q\":\"value\"}".to_string(),
+            },
+        };
+        let azure = AzureOpenAIToolCall::from(&call);
+        assert_eq!(azure.id, "call_1");
+        assert_eq!(azure.content_type, "function");
+        assert_eq!(azure.function.name, "lookup");
+    }
+
+    #[test]
+    fn test_azure_embedding_request_serialization() {
+        let req = OpenAIEmbeddingRequest {
+            model: "embed".to_string(),
+            input: vec!["a".to_string(), "b".to_string()],
+            encoding_format: Some("float".to_string()),
+            dimensions: Some(3),
+        };
+        let serialized = serde_json::to_value(&req).unwrap();
+        assert_eq!(serialized.get("model"), Some(&serde_json::json!("embed")));
+        assert_eq!(
+            serialized
+                .get("input")
+                .and_then(|v| v.as_array())
+                .unwrap()
+                .len(),
+            2
+        );
+    }
+
+    #[test]
+    fn test_azure_tool_serialization() {
+        let tool = Tool {
+            tool_type: "function".to_string(),
+            function: crate::chat::FunctionTool {
+                name: "lookup".to_string(),
+                description: "desc".to_string(),
+                parameters: serde_json::json!({
+                    "type": "object",
+                    "properties": {}
+                }),
+            },
+        };
+        let serialized = serde_json::to_value(&tool).unwrap();
+        assert_eq!(serialized.get("type"), Some(&serde_json::json!("function")));
+    }
+
+    #[tokio::test]
+    async fn test_azure_chat_with_tools_and_embed_use_mock_server() {
+        let server = MockServer::start();
+        let endpoint = server.base_url();
+        let provider = AzureOpenAI::new(
+            "key",
+            "2024-01-01",
+            "dep-123",
+            endpoint.clone(),
+            Some("gpt-4o-mini".to_string()),
+            Some(128),
+            Some(0.2),
+            Some(5),
+            Some(0.9),
+            Some(16),
+            Some("float".to_string()),
+            Some(3),
+            Some(ToolChoice::Auto),
+            Some("medium".to_string()),
+        );
+
+        let chat_mock = server.mock(|when, then| {
+            when.method(POST)
+                .path("/openai/deployments/dep-123/chat/completions")
+                .header("api-key", "key")
+                .body_includes("\"reasoning_effort\":\"medium\"")
+                .body_includes("\"tool_choice\":\"auto\"")
+                .body_includes("\"response_format\"");
+            then.status(200).json_body(json!({
+                "choices": [{
+                    "message": {
+                        "role": "assistant",
+                        "content": "azure reply"
+                    }
+                }],
+                "usage": {
+                    "prompt_tokens": 1,
+                    "completion_tokens": 2,
+                    "total_tokens": 3
+                }
+            }));
+        });
+
+        let messages = vec![ChatMessage::user().content("hello").build()];
+        let response = provider
+            .chat_with_tools(
+                &messages,
+                Some(&[sample_tool()]),
+                Some(StructuredOutputFormat {
+                    name: "Answer".to_string(),
+                    description: None,
+                    schema: Some(json!({
+                        "type": "object",
+                        "properties": {
+                            "answer": { "type": "string" }
+                        }
+                    })),
+                    strict: Some(true),
+                }),
+            )
+            .await
+            .expect("azure chat should succeed");
+        assert_eq!(response.text().as_deref(), Some("azure reply"));
+        chat_mock.assert();
+
+        let embed_mock = server.mock(|when, then| {
+            when.method(POST)
+                .path("/openai/deployments/dep-123/embeddings")
+                .header("api-key", "key")
+                .body_includes("\"encoding_format\":\"float\"")
+                .body_includes("\"dimensions\":3");
+            then.status(200).json_body(json!({
+                "data": [
+                    { "embedding": [0.1, 0.2, 0.3] }
+                ]
+            }));
+        });
+
+        let embeddings = provider
+            .embed(vec!["hello".to_string()])
+            .await
+            .expect("embeddings should succeed");
+        assert_eq!(embeddings, vec![vec![0.1, 0.2, 0.3]]);
+        embed_mock.assert();
+    }
+
+    #[tokio::test]
+    async fn test_azure_chat_returns_error_for_status_and_invalid_json() {
+        let server = MockServer::start();
+        let provider = AzureOpenAI::new(
+            "key",
+            "2024-01-01",
+            "dep-123",
+            server.base_url(),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        );
+        let messages = vec![ChatMessage::user().content("hello").build()];
+
+        let error_mock = server.mock(|when, then| {
+            when.method(POST)
+                .path("/openai/deployments/dep-123/chat/completions");
+            then.status(500).body("azure down");
+        });
+
+        let err = provider
+            .chat_with_tools(&messages, None, None)
+            .await
+            .expect_err("error status should fail");
+        match err {
+            LLMError::ResponseFormatError {
+                message,
+                raw_response,
+            } => {
+                assert!(message.contains("returned error status"));
+                assert_eq!(raw_response, "azure down");
+            }
+            other => panic!("unexpected error: {other:?}"),
+        }
+        error_mock.assert();
+
+        let server = MockServer::start();
+        let provider = AzureOpenAI::new(
+            "key",
+            "2024-01-01",
+            "dep-123",
+            server.base_url(),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        );
+        let invalid_mock = server.mock(|when, then| {
+            when.method(POST)
+                .path("/openai/deployments/dep-123/chat/completions");
+            then.status(200).body("not-json");
+        });
+
+        let err = provider
+            .chat_with_tools(&messages, None, None)
+            .await
+            .expect_err("invalid json should fail");
+        match err {
+            LLMError::ResponseFormatError {
+                message,
+                raw_response,
+            } => {
+                assert!(message.contains("Failed to decode"));
+                assert_eq!(raw_response, "not-json");
+            }
+            other => panic!("unexpected error: {other:?}"),
+        }
+        invalid_mock.assert();
+    }
+}

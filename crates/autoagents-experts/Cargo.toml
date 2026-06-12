@@ -1,0 +1,25 @@
+[package]
+name = "autoagents-experts"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Expert agents - coding, ops, document, information, knowledge base agents"
+repository.workspace = true
+keywords.workspace = true
+categories.workspace = true
+
+[dependencies]
+autoagents.workspace = true
+autoagents-core.workspace = true
+autoagents-derive.workspace = true
+autoagents-llm.workspace = true
+autoagents-toolkit.workspace = true
+autoagents-tool-auth = { path = "../autoagents-tool-auth" }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+async-trait = { workspace = true }
+log = { workspace = true }
+
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+tokio = { workspace = true }

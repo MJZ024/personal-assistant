@@ -1,0 +1,41 @@
+[package]
+name = "autoagents"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description.workspace = true
+repository.workspace = true
+keywords.workspace = true
+categories.workspace = true
+readme.workspace = true
+
+[features]
+default = []
+full = ["autoagents-core/full", "autoagents-llm/full", "wasmtime", "logging", "codeact"]
+openai = ["autoagents-llm/openai"]
+anthropic = ["autoagents-llm/anthropic"]
+ollama = ["autoagents-llm/ollama"]
+deepseek = ["autoagents-llm/deepseek"]
+xai = ["autoagents-llm/xai"]
+phind = ["autoagents-llm/phind"]
+google = ["autoagents-llm/google"]
+groq = ["autoagents-llm/groq"]
+azure_openai = ["autoagents-llm/azure_openai"]
+openrouter = ["autoagents-llm/openrouter"]
+minimax = ["autoagents-llm/minimax"]
+optim = ["autoagents-llm/optim"]
+logging = ["dep:env_logger"]
+wasmtime = ["autoagents-core/wasmtime"]
+codeact = ["autoagents-core/codeact"]
+
+[dependencies]
+autoagents-core.workspace = true
+autoagents-llm.workspace = true
+autoagents-protocol.workspace = true
+async-trait = { workspace = true }
+env_logger = { workspace = true, optional = true }
+autoagents-derive.workspace = true
+
+[dev-dependencies]
+serde_json = { workspace = true }
+tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }

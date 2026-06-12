@@ -1,0 +1,73 @@
+# Personal Assistant Configuration
+
+feishu:
+  app_id: "cli_xxxxxxxxxxxx"
+  app_secret: "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+  verification_token: "xxxxxxxxxxxxxxxx"
+  bot_name: "个人助理"
+  max_upload_size: 20971520  # 20MB
+  api_base_url: "https://open.feishu.cn/open-apis"
+  listen_addr: "0.0.0.0:8080"
+
+supervisor:
+  max_concurrent_tasks: 2
+  heartbeat_interval_secs: 300
+  wal_checkpoint_interval_secs: 3600
+
+memory:
+  db_path: "/opt/personal-assistant/tasks.db"
+  heartbeat_interval_secs: 300
+  wal_checkpoint_interval_secs: 3600
+  backup_dir: "/opt/personal-assistant/backups"
+
+tool_auth:
+  agent_permissions:
+    coding: "System"
+    ops: "Destructive"
+    document: "Write"
+    information: "Safe"
+    knowledge: "Write"
+    supervisor: "System"
+  shell_blacklist_patterns:
+    - "rm\\s+(-[rRf]+\\s+)*/"
+    - "mkfs\\."
+    - "dd\\s+if="
+    - ">\\s*/dev/sd"
+    - ":\\(\\)\\s*\\{\\s*:\\|:&\\s*\\}\\s*;:"
+  shell_whitelist_patterns: []
+  audit_log_path: "/opt/personal-assistant/audit/audit.log"
+
+models:
+  agents:
+    - name: "supervisor"
+      primary:
+        provider: "minimax"
+        model: "abab6.5s-chat"
+        api_key_env: "MINIMAX_KEY"
+      fallbacks:
+        - provider: "deepseek"
+          model: "deepseek-chat"
+          api_key_env: "DEEPSEEK_KEY"
+        - provider: "glm"
+          model: "glm-4-flash"
+          api_key_env: "GLM_KEY"
+
+    - name: "coding"
+      primary:
+        provider: "minimax"
+        model: "minimax-m1"
+        api_key_env: "MINIMAX_KEY"
+      fallbacks:
+        - provider: "deepseek"
+          model: "deepseek-coder"
+          api_key_env: "DEEPSEEK_KEY"
+
+    - name: "ops"
+      primary:
+        provider: "minimax"
+        model: "abab6.5s-chat"
+        api_key_env: "MINIMAX_KEY"
+      fallbacks:
+        - provider: "deepseek"
+          model: "deepseek-chat"
+          api_key_env: "DEEPSEEK_KEY"

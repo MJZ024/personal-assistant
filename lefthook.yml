@@ -1,0 +1,24 @@
+pre-commit:
+  parallel: true
+  commands:
+    fmt:
+      run: cargo fmt -- --check
+      stage_fixed: true
+
+    clippy:
+      run: cargo clippy --workspace --all-targets -- -D warnings
+
+    test:
+      run: cargo test --features "full" --workspace
+
+    check:
+      run: cargo check --all-features --all-targets
+
+    python-bindings:
+      glob: "{bindings/python/**,Makefile,scripts/python-bindings/**,.github/workflows/ci-chek.yml,lefthook.yml}"
+      run: make python-bindings-test
+
+#pre-push:
+#  commands:
+#    doc:
+#      run: cargo doc --all-features --no-deps

@@ -1,0 +1,1495 @@
+//! MistralRsProvider implementation with LLMProvider traits
+
+use crate::{
+    config::{MistralRsConfig, MistralRsConfigBuilder},
+    conversion::{
+        MistralRsResponse, convert_messages, convert_tool_calls, convert_vision_messages,
+    },
+    error::convert_anyhow_error,
+    models::{ModelSource, ModelType},
+};
+use autoagents_llm::{
+    FunctionCall, LLMProvider, ToolCall, async_trait,
+    chat::{
+        ChatMessage, ChatProvider, ChatResponse, StreamChoice, StreamChunk, StreamDelta,
+        StreamResponse, StructuredOutputFormat, Tool, Usage as ChatUsage,
+    },
+    completion::{CompletionProvider, CompletionRequest, CompletionResponse},
+    embedding::EmbeddingProvider,
+    error::LLMError,
+    models::ModelsProvider,
+};
+use futures::{StreamExt, stream::Stream};
+use mistralrs::{
+    CalledFunction, ChatCompletionChunkResponse, ChatCompletionResponse, ChunkChoice, Constraint,
+    Function, GgufModelBuilder, IsqType, PagedAttentionMetaBuilder, RequestBuilder, Response,
+    TextMessageRole, TextModelBuilder, ToolCallResponse, ToolCallType,
+    ToolChoice as MistralToolChoice, ToolType, Usage as MistralUsage, VisionModelBuilder,
+};
+use std::sync::OnceLock;
+use std::{
+    collections::{HashMap, VecDeque},
+    pin::Pin,
+    sync::Arc,
+};
+use tokio::sync::mpsc;
+
+/// Dedicated tokio runtime for the mistral-rs provider.
+///
+/// Each compiled `.so` has its own copy of tokio's thread-local runtime state.
+/// When this crate is used from a Python extension the calling async context
+/// runs on a different `.so`'s runtime, so `tokio::spawn` here would panic
+/// with "no reactor running". Using a crate-local runtime avoids that.
+fn get_rt() -> &'static tokio::runtime::Runtime {
+    static RT: OnceLock<tokio::runtime::Runtime> = OnceLock::new();
+    RT.get_or_init(|| {
+        tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .thread_name("mistralrs")
+            .build()
+            .expect("mistralrs runtime init failed")
+    })
+}
+
+/// MistralRs provider for local LLM inference
+pub struct MistralRsProvider {
+    model: Arc<mistralrs::Model>,
+    config: MistralRsConfig,
+}
+
+impl MistralRsProvider {
+    /// Create provider from HuggingFace model repository
+    pub async fn from_hf(repo_id: impl Into<String>) -> Result<Self, LLMError> {
+        let config = MistralRsConfigBuilder::new()
+            .model_source(ModelSource::HuggingFace {
+                repo_id: repo_id.into(),
+                revision: None,
+                model_type: crate::models::ModelType::Auto,
+            })
+            .build();
+
+        Self::from_config(config).await
+    }
+
+    /// Create provider from GGUF files
+    pub async fn from_gguf(
+        model_dir: impl Into<String>,
+        files: Vec<String>,
+    ) -> Result<Self, LLMError> {
+        let config = MistralRsConfigBuilder::new()
+            .model_source(ModelSource::Gguf {
+                model_dir: model_dir.into(),
+                files,
+                tokenizer: None,
+                chat_template: None,
+            })
+            .build();
+
+        Self::from_config(config).await
+    }
+
+    /// Create provider from configuration
+    pub async fn from_config(config: MistralRsConfig) -> Result<Self, LLMError> {
+        let model = Self::build_model(&config).await?;
+
+        Ok(Self {
+            model: Arc::new(model),
+            config,
+        })
+    }
+
+    /// Get a builder for advanced configuration
+    pub fn builder() -> MistralRsProviderBuilder {
+        MistralRsProviderBuilder::default()
+    }
+
+    /// Internal method to build the mistralrs model
+    async fn build_model(config: &MistralRsConfig) -> Result<mistralrs::Model, LLMError> {
+        match &config.model_source {
+            ModelSource::HuggingFace { repo_id, .. } => {
+                let detected_type = config.model_source.detect_model_type();
+                match detected_type {
+                    crate::models::ModelType::Vision => {
+                        Self::build_vision_model(repo_id, config).await
+                    }
+                    _ => Self::build_hf_model(repo_id, config).await,
+                }
+            }
+            ModelSource::Gguf {
+                model_dir,
+                files,
+                tokenizer,
+                chat_template,
+            } => Self::build_gguf_model(model_dir, files, tokenizer, chat_template, config).await,
+        }
+    }
+
+    /// Build HuggingFace text model
+    async fn build_hf_model(
+        repo_id: &str,
+        config: &MistralRsConfig,
+    ) -> Result<mistralrs::Model, LLMError> {
+        let mut builder = TextModelBuilder::new(repo_id.to_string());
+
+        // Apply ISQ if specified
+        if let Some(isq) = config.isq_type {
+            builder = builder.with_isq(isq);
+        }
+
+        // Apply paged attention if enabled
+        if config.paged_attention {
+            builder = builder
+                .with_paged_attn(|| PagedAttentionMetaBuilder::default().build())
+                .map_err(convert_anyhow_error)?;
+        }
+
+        // Apply logging if enabled
+        if config.logging {
+            builder = builder.with_logging();
+        }
+
+        // Build the model
+        builder.build().await.map_err(convert_anyhow_error)
+    }
+
+    /// Build vision model
+    async fn build_vision_model(
+        repo_id: &str,
+        config: &MistralRsConfig,
+    ) -> Result<mistralrs::Model, LLMError> {
+        let mut builder = VisionModelBuilder::new(repo_id.to_string());
+
+        // Apply ISQ if specified
+        if let Some(isq) = config.isq_type {
+            builder = builder.with_isq(isq);
+        }
+
+        // Apply logging if enabled
+        if config.logging {
+            builder = builder.with_logging();
+        }
+
+        // Build the model
+        builder.build().await.map_err(convert_anyhow_error)
+    }
+
+    /// Build GGUF model
+    async fn build_gguf_model(
+        model_dir: &str,
+        files: &[String],
+        tokenizer: &Option<String>,
+        chat_template: &Option<String>,
+        config: &MistralRsConfig,
+    ) -> Result<mistralrs::Model, LLMError> {
+        let mut builder = GgufModelBuilder::new(model_dir, files.to_vec());
+
+        // Apply tokenizer if specified
+        if let Some(tok) = tokenizer {
+            builder = builder.with_tok_model_id(tok);
+        }
+
+        // Apply chat template if specified
+        if let Some(template) = chat_template {
+            builder = builder.with_chat_template(template);
+        }
+
+        // Apply paged attention if enabled
+        if config.paged_attention {
+            builder = builder
+                .with_paged_attn(|| PagedAttentionMetaBuilder::default().build())
+                .map_err(convert_anyhow_error)?;
+        }
+
+        // Apply logging if enabled
+        if config.logging {
+            builder = builder.with_logging();
+        }
+
+        // Build the model
+        builder.build().await.map_err(convert_anyhow_error)
+    }
+
+    /// Get reference to the configuration
+    pub fn config(&self) -> &MistralRsConfig {
+        &self.config
+    }
+
+    fn prepare_messages_with_system(&self, messages: &[ChatMessage]) -> Vec<ChatMessage> {
+        let mut all_messages = Vec::new();
+
+        if let Some(system_prompt) = &self.config.system_prompt {
+            let has_system_message = messages
+                .iter()
+                .any(|msg| msg.role == autoagents_llm::chat::ChatRole::System);
+
+            if !has_system_message {
+                all_messages.push(ChatMessage {
+                    role: autoagents_llm::chat::ChatRole::System,
+                    message_type: autoagents_llm::chat::MessageType::Text,
+                    content: system_prompt.clone(),
+                });
+            }
+        }
+
+        all_messages.extend_from_slice(messages);
+        all_messages
+    }
+
+    fn build_stream_request(
+        &self,
+        messages: &[ChatMessage],
+        tools: Option<&[Tool]>,
+        json_schema: Option<StructuredOutputFormat>,
+    ) -> Result<RequestBuilder, LLMError> {
+        let all_messages = self.prepare_messages_with_system(messages);
+        let is_vision_model = self.config.model_source.detect_model_type() == ModelType::Vision;
+        let has_images = all_messages.iter().any(|msg| {
+            matches!(
+                msg.message_type,
+                autoagents_llm::chat::MessageType::Image(_)
+                    | autoagents_llm::chat::MessageType::ImageURL(_)
+            )
+        });
+
+        let request_builder = if tools.is_some() || json_schema.is_some() {
+            build_request_builder(&all_messages, tools, json_schema)?
+        } else if is_vision_model || has_images {
+            let vision_messages = convert_vision_messages(&all_messages, &self.model)
+                .map_err(convert_anyhow_error)?;
+            RequestBuilder::from(vision_messages)
+        } else {
+            let text_messages = convert_messages(&all_messages);
+            RequestBuilder::from(text_messages)
+        };
+
+        Ok(self.apply_sampling_params(request_builder))
+    }
+
+    fn apply_sampling_params(&self, request_builder: RequestBuilder) -> RequestBuilder {
+        let mut builder = request_builder;
+
+        if let Some(max_tokens) = self.config.max_tokens {
+            builder = builder.set_sampler_max_len(max_tokens as usize);
+        }
+        if let Some(temperature) = self.config.temperature {
+            builder = builder.set_sampler_temperature(temperature as f64);
+        }
+        if let Some(top_p) = self.config.top_p {
+            builder = builder.set_sampler_topp(f64::from(top_p));
+        }
+        if let Some(top_k) = self.config.top_k {
+            builder = builder.set_sampler_topk(top_k as usize);
+        }
+
+        builder
+    }
+
+    fn convert_usage(usage: MistralUsage) -> ChatUsage {
+        ChatUsage {
+            prompt_tokens: usage.prompt_tokens as u32,
+            completion_tokens: usage.completion_tokens as u32,
+            total_tokens: usage.total_tokens as u32,
+            completion_tokens_details: None,
+            prompt_tokens_details: None,
+        }
+    }
+
+    fn chunk_to_stream_response(chunk: ChatCompletionChunkResponse) -> Option<StreamResponse> {
+        let choices: Vec<StreamChoice> = chunk
+            .choices
+            .into_iter()
+            .filter_map(|choice: ChunkChoice| {
+                let tool_calls = choice.delta.tool_calls.map(|calls| {
+                    calls
+                        .into_iter()
+                        .map(|call| ToolCall {
+                            id: call.id,
+                            call_type: call.tp.to_string(),
+                            function: FunctionCall {
+                                name: call.function.name,
+                                arguments: call.function.arguments,
+                            },
+                        })
+                        .collect::<Vec<_>>()
+                });
+
+                let content = choice.delta.content;
+                let reasoning_content = choice.delta.reasoning_content;
+                let has_tool_calls = tool_calls
+                    .as_ref()
+                    .map(|calls| !calls.is_empty())
+                    .unwrap_or(false);
+                let has_content = content.as_ref().map(|c| !c.is_empty()).unwrap_or(false);
+                let has_reasoning = reasoning_content
+                    .as_ref()
+                    .map(|c| !c.is_empty())
+                    .unwrap_or(false);
+
+                if !has_content && !has_reasoning && !has_tool_calls {
+                    return None;
+                }
+
+                Some(StreamChoice {
+                    delta: StreamDelta {
+                        content,
+                        reasoning_content,
+                        tool_calls,
+                    },
+                })
+            })
+            .collect();
+
+        if choices.is_empty() && chunk.usage.is_none() {
+            return None;
+        }
+
+        Some(StreamResponse {
+            choices,
+            usage: chunk.usage.map(Self::convert_usage),
+        })
+    }
+
+    fn done_to_stream_response(done: ChatCompletionResponse) -> StreamResponse {
+        StreamResponse {
+            choices: vec![StreamChoice {
+                delta: StreamDelta {
+                    content: None,
+                    reasoning_content: None,
+                    tool_calls: None,
+                },
+            }],
+            usage: Some(Self::convert_usage(done.usage)),
+        }
+    }
+
+    fn spawn_response_stream(
+        model: Arc<mistralrs::Model>,
+        request_builder: RequestBuilder,
+    ) -> std::pin::Pin<Box<dyn Stream<Item = Result<MistralStreamEvent, LLMError>> + Send>> {
+        let (tx, rx) = mpsc::unbounded_channel::<Result<MistralStreamEvent, LLMError>>();
+
+        get_rt().spawn(async move {
+            match model.stream_chat_request(request_builder).await {
+                Ok(mut response_stream) => {
+                    while let Some(response) = response_stream.next().await {
+                        match response {
+                            Response::Chunk(chunk) => {
+                                if tx.send(Ok(MistralStreamEvent::Chunk(chunk))).is_err() {
+                                    break;
+                                }
+                            }
+                            Response::Done(done) => {
+                                let _ = tx.send(Ok(MistralStreamEvent::Done(done)));
+                                break;
+                            }
+                            Response::InternalError(err) => {
+                                let _ = tx.send(Err(LLMError::ProviderError(format!(
+                                    "Mistral.rs internal error: {}",
+                                    err
+                                ))));
+                                break;
+                            }
+                            Response::ValidationError(err) => {
+                                let _ = tx.send(Err(LLMError::InvalidRequest(err.to_string())));
+                                break;
+                            }
+                            Response::ModelError(msg, _) => {
+                                let _ = tx.send(Err(LLMError::ProviderError(msg)));
+                                break;
+                            }
+                            Response::CompletionModelError(msg, _) => {
+                                let _ = tx.send(Err(LLMError::ProviderError(format!(
+                                    "Mistral.rs completion error: {}",
+                                    msg
+                                ))));
+                                break;
+                            }
+                            Response::CompletionDone(_)
+                            | Response::CompletionChunk(_)
+                            | Response::Speech { .. }
+                            | Response::ImageGeneration(_)
+                            | Response::Raw { .. } => {
+                                let _ = tx.send(Err(LLMError::Generic(
+                                    "Unexpected streaming response variant for chat request"
+                                        .to_string(),
+                                )));
+                                break;
+                            }
+                            Response::Embeddings { .. } => {
+                                let _ = tx.send(Err(LLMError::Generic(
+                                    "Embedding streaming response variant for chat request"
+                                        .to_string(),
+                                )));
+                                break;
+                            }
+                        }
+                    }
+                }
+                Err(err) => {
+                    let _ = tx.send(Err(convert_anyhow_error(err)));
+                }
+            }
+        });
+
+        let output_stream = futures::stream::unfold(rx, |mut rx| async move {
+            rx.recv().await.map(|item| (item, rx))
+        });
+
+        Box::pin(output_stream)
+    }
+}
+
+enum MistralStreamEvent {
+    Chunk(ChatCompletionChunkResponse),
+    Done(ChatCompletionResponse),
+}
+
+struct ToolUseState {
+    id: String,
+    name: String,
+    arguments: String,
+    call_type: String,
+    started: bool,
+}
+
+impl Default for ToolUseState {
+    fn default() -> Self {
+        Self {
+            id: String::default(),
+            name: String::default(),
+            arguments: String::default(),
+            call_type: "function".to_string(),
+            started: false,
+        }
+    }
+}
+
+struct ToolStreamState {
+    inner: Pin<Box<dyn Stream<Item = Result<MistralStreamEvent, LLMError>> + Send>>,
+    pending: VecDeque<Result<StreamChunk, LLMError>>,
+    tool_states: HashMap<usize, ToolUseState>,
+    stop_reason: Option<String>,
+    saw_tool_use: bool,
+    usage_emitted: bool,
+    done_sent: bool,
+}
+
+impl ToolStreamState {
+    fn new(
+        inner: Pin<Box<dyn Stream<Item = Result<MistralStreamEvent, LLMError>> + Send>>,
+    ) -> Self {
+        Self {
+            inner,
+            pending: VecDeque::new(),
+            tool_states: HashMap::new(),
+            stop_reason: None,
+            saw_tool_use: false,
+            usage_emitted: false,
+            done_sent: false,
+        }
+    }
+}
+
+fn normalize_stop_reason(reason: Option<String>, saw_tool_use: bool) -> String {
+    let fallback = if saw_tool_use { "tool_use" } else { "end_turn" };
+    let raw = reason.as_deref().unwrap_or(fallback);
+    match raw {
+        "tool_calls" => "tool_use".to_string(),
+        "stop" => "end_turn".to_string(),
+        other => other.to_string(),
+    }
+}
+
+fn push_tool_call_updates(
+    tool_calls: Vec<ToolCallResponse>,
+    tool_states: &mut HashMap<usize, ToolUseState>,
+    pending: &mut VecDeque<Result<StreamChunk, LLMError>>,
+    saw_tool_use: &mut bool,
+) {
+    for tool_call in tool_calls {
+        let index = tool_call.index;
+        let state = tool_states.entry(index).or_default();
+
+        if !tool_call.id.is_empty() {
+            state.id.clone_from(&tool_call.id);
+        }
+        if !tool_call.function.name.is_empty() {
+            state.name.clone_from(&tool_call.function.name);
+            if !state.started {
+                state.started = true;
+                *saw_tool_use = true;
+                pending.push_back(Ok(StreamChunk::ToolUseStart {
+                    index,
+                    id: state.id.clone(),
+                    name: state.name.clone(),
+                }));
+            }
+        }
+        if !tool_call.function.arguments.is_empty() {
+            state.arguments.push_str(&tool_call.function.arguments);
+            *saw_tool_use = true;
+            pending.push_back(Ok(StreamChunk::ToolUseInputDelta {
+                index,
+                partial_json: tool_call.function.arguments.clone(),
+            }));
+        }
+        state.call_type = tool_call.tp.to_string();
+    }
+}
+
+fn push_tool_completions(state: &mut ToolStreamState) {
+    for (index, tool_state) in state.tool_states.drain() {
+        if tool_state.started {
+            state.pending.push_back(Ok(StreamChunk::ToolUseComplete {
+                index,
+                tool_call: ToolCall {
+                    id: tool_state.id,
+                    call_type: tool_state.call_type,
+                    function: FunctionCall {
+                        name: tool_state.name,
+                        arguments: tool_state.arguments,
+                    },
+                },
+            }));
+        }
+    }
+}
+
+fn handle_chunk_for_tool_stream(state: &mut ToolStreamState, chunk: ChatCompletionChunkResponse) {
+    for choice in chunk.choices {
+        if let Some(content) = choice.delta.content
+            && !content.is_empty()
+        {
+            state.pending.push_back(Ok(StreamChunk::Text(content)));
+        }
+        if let Some(reasoning_content) = choice.delta.reasoning_content
+            && !reasoning_content.is_empty()
+        {
+            state
+                .pending
+                .push_back(Ok(StreamChunk::ReasoningContent(reasoning_content)));
+        }
+        if let Some(tool_calls) = choice.delta.tool_calls
+            && !tool_calls.is_empty()
+        {
+            push_tool_call_updates(
+                tool_calls,
+                &mut state.tool_states,
+                &mut state.pending,
+                &mut state.saw_tool_use,
+            );
+        }
+        if let Some(finish_reason) = choice.finish_reason {
+            state.stop_reason = Some(finish_reason);
+        }
+    }
+
+    if let Some(usage) = chunk.usage
+        && !state.usage_emitted
+    {
+        state
+            .pending
+            .push_back(Ok(StreamChunk::Usage(MistralRsProvider::convert_usage(
+                usage,
+            ))));
+        state.usage_emitted = true;
+    }
+}
+
+fn finalize_tool_stream(state: &mut ToolStreamState) {
+    push_tool_completions(state);
+    let stop_reason = normalize_stop_reason(state.stop_reason.take(), state.saw_tool_use);
+    state
+        .pending
+        .push_back(Ok(StreamChunk::Done { stop_reason }));
+    state.done_sent = true;
+}
+
+fn handle_done_for_tool_stream(state: &mut ToolStreamState, done: ChatCompletionResponse) {
+    let ChatCompletionResponse { choices, usage, .. } = done;
+    if let Some(choice) = choices.first() {
+        state.stop_reason = Some(choice.finish_reason.clone());
+    }
+
+    for choice in choices {
+        if let Some(tool_calls) = choice.message.tool_calls
+            && !tool_calls.is_empty()
+        {
+            push_tool_call_updates(
+                tool_calls,
+                &mut state.tool_states,
+                &mut state.pending,
+                &mut state.saw_tool_use,
+            );
+        }
+    }
+
+    push_tool_completions(state);
+    if !state.usage_emitted {
+        state
+            .pending
+            .push_back(Ok(StreamChunk::Usage(MistralRsProvider::convert_usage(
+                usage,
+            ))));
+        state.usage_emitted = true;
+    }
+    finalize_tool_stream(state);
+}
+
+/// Builder for MistralRsProvider
+#[derive(Default)]
+pub struct MistralRsProviderBuilder {
+    config_builder: MistralRsConfigBuilder,
+}
+
+impl MistralRsProviderBuilder {
+    /// Create a new builder
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Set the model source
+    pub fn model_source(mut self, source: ModelSource) -> Self {
+        self.config_builder = self.config_builder.model_source(source);
+        self
+    }
+
+    /// Set ISQ type
+    pub fn with_isq(mut self, isq: IsqType) -> Self {
+        self.config_builder = self.config_builder.with_isq(isq);
+        self
+    }
+
+    /// Enable paged attention
+    pub fn with_paged_attention(mut self) -> Self {
+        self.config_builder = self.config_builder.with_paged_attention();
+        self
+    }
+
+    /// Enable logging
+    pub fn with_logging(mut self) -> Self {
+        self.config_builder = self.config_builder.with_logging();
+        self
+    }
+
+    /// Set max tokens
+    pub fn max_tokens(mut self, tokens: u32) -> Self {
+        self.config_builder = self.config_builder.max_tokens(tokens);
+        self
+    }
+
+    /// Set temperature
+    pub fn temperature(mut self, temp: f32) -> Self {
+        self.config_builder = self.config_builder.temperature(temp);
+        self
+    }
+
+    /// Set top-p
+    pub fn top_p(mut self, p: f32) -> Self {
+        self.config_builder = self.config_builder.top_p(p);
+        self
+    }
+
+    /// Set top-k
+    pub fn top_k(mut self, k: u32) -> Self {
+        self.config_builder = self.config_builder.top_k(k);
+        self
+    }
+
+    /// Set system prompt
+    pub fn system_prompt(mut self, prompt: impl Into<String>) -> Self {
+        self.config_builder = self.config_builder.system_prompt(prompt);
+        self
+    }
+
+    /// Build the provider
+    pub async fn build(self) -> Result<MistralRsProvider, LLMError> {
+        let config = self.config_builder.build();
+        MistralRsProvider::from_config(config).await
+    }
+}
+
+/// Convert AutoAgents ChatRole to mistral.rs TextMessageRole for RequestBuilder
+fn convert_role_for_request(role: &autoagents_llm::chat::ChatRole) -> TextMessageRole {
+    match role {
+        autoagents_llm::chat::ChatRole::System => TextMessageRole::System,
+        autoagents_llm::chat::ChatRole::User => TextMessageRole::User,
+        autoagents_llm::chat::ChatRole::Assistant => TextMessageRole::Assistant,
+        autoagents_llm::chat::ChatRole::Tool => TextMessageRole::User,
+    }
+}
+
+/// Convert AutoAgents Tool to mistral.rs Tool
+fn convert_tools(tools: &[Tool]) -> Vec<mistralrs::Tool> {
+    tools
+        .iter()
+        .map(|tool| mistralrs::Tool {
+            tp: ToolType::Function,
+            function: Function {
+                name: tool.function.name.clone(),
+                description: Some(tool.function.description.clone()),
+                parameters: Some(
+                    serde_json::from_value(tool.function.parameters.clone()).unwrap_or_default(),
+                ),
+            },
+        })
+        .collect()
+}
+
+/// Build a RequestBuilder with tools and/or structured output constraint
+fn build_request_builder(
+    messages: &[ChatMessage],
+    tools: Option<&[Tool]>,
+    json_schema: Option<StructuredOutputFormat>,
+) -> Result<RequestBuilder, LLMError> {
+    let mut request = RequestBuilder::new();
+
+    // Add all messages
+    for msg in messages {
+        let role = convert_role_for_request(&msg.role);
+
+        // Handle different message types
+        let content = match &msg.message_type {
+            autoagents_llm::chat::MessageType::Text => msg.content.clone(),
+            autoagents_llm::chat::MessageType::Image(_) => {
+                format!("[Image: {}]", msg.content)
+            }
+            autoagents_llm::chat::MessageType::ImageURL(url) => {
+                format!("[Image URL: {}] {}", url, msg.content)
+            }
+            autoagents_llm::chat::MessageType::Pdf(_) => {
+                format!("[PDF Document] {}", msg.content)
+            }
+            autoagents_llm::chat::MessageType::ToolUse(tool_calls) => {
+                // For tool use messages, add them with tool calls
+                if !tool_calls.is_empty() {
+                    // Convert to mistral.rs ToolCallResponse format
+                    let mistral_tool_calls: Vec<ToolCallResponse> = tool_calls
+                        .iter()
+                        .enumerate()
+                        .map(|(index, tc)| ToolCallResponse {
+                            index,
+                            id: tc.id.clone(),
+                            tp: ToolCallType::Function,
+                            function: CalledFunction {
+                                name: tc.function.name.clone(),
+                                arguments: tc.function.arguments.clone(),
+                            },
+                        })
+                        .collect();
+
+                    request = request.add_message_with_tool_call(
+                        role,
+                        msg.content.clone(),
+                        mistral_tool_calls,
+                    );
+                    continue;
+                }
+                msg.content.clone()
+            }
+            autoagents_llm::chat::MessageType::ToolResult(tool_results) => {
+                // For tool results, add them as tool messages
+                for tc in tool_results {
+                    request =
+                        request.add_tool_message(tc.function.arguments.clone(), tc.id.clone());
+                }
+                continue;
+            }
+        };
+
+        request = request.add_message(role, content);
+    }
+
+    // Set tools if provided
+    if let Some(tools) = tools {
+        let mistral_tools = convert_tools(tools);
+        request = request
+            .set_tools(mistral_tools)
+            .set_tool_choice(MistralToolChoice::Auto);
+    }
+
+    if tools.is_none()
+        && let Some(schema) = json_schema
+        && let Some(json_schema) = schema.schema
+    {
+        request = request.set_constraint(Constraint::JsonSchema(json_schema));
+    }
+
+    Ok(request)
+}
+
+#[async_trait]
+impl ChatProvider for MistralRsProvider {
+    async fn chat_with_tools(
+        &self,
+        messages: &[ChatMessage],
+        tools: Option<&[Tool]>,
+        json_schema: Option<StructuredOutputFormat>,
+    ) -> Result<Box<dyn ChatResponse>, LLMError> {
+        // Prepare messages with system prompt if needed
+        let mut all_messages = Vec::new();
+
+        // If a system_prompt is configured and there's no system message in messages,
+        // prepend it as the first system message
+        if let Some(system_prompt) = &self.config.system_prompt {
+            let has_system_message = messages
+                .iter()
+                .any(|msg| msg.role == autoagents_llm::chat::ChatRole::System);
+
+            if !has_system_message {
+                all_messages.push(ChatMessage {
+                    role: autoagents_llm::chat::ChatRole::System,
+                    message_type: autoagents_llm::chat::MessageType::Text,
+                    content: system_prompt.clone(),
+                });
+            }
+        }
+        all_messages.extend_from_slice(messages);
+
+        // Detect if this is a vision model by checking model type
+        let is_vision_model = self.config.model_source.detect_model_type() == ModelType::Vision;
+
+        // Check if messages contain images
+        let has_images = all_messages.iter().any(|msg| {
+            matches!(
+                msg.message_type,
+                autoagents_llm::chat::MessageType::Image(_)
+            )
+        });
+
+        // Send chat request based on model type and message content
+        // Use RequestBuilder if tools or structured output is needed
+        let response = if tools.is_some() || json_schema.is_some() {
+            // Use RequestBuilder for tools or structured output
+            let request = build_request_builder(&all_messages, tools, json_schema)?;
+            self.model
+                .send_chat_request(request)
+                .await
+                .map_err(convert_anyhow_error)?
+        } else if is_vision_model || has_images {
+            // Use vision messages for vision models or when images are present
+            let vision_messages = convert_vision_messages(&all_messages, &self.model)
+                .map_err(convert_anyhow_error)?;
+            self.model
+                .send_chat_request(vision_messages)
+                .await
+                .map_err(convert_anyhow_error)?
+        } else {
+            // Use text messages for text-only models
+            let text_messages = convert_messages(&all_messages);
+            self.model
+                .send_chat_request(text_messages)
+                .await
+                .map_err(convert_anyhow_error)?
+        };
+
+        // Extract text and tool calls from response
+        let first_choice = response.choices.first();
+        let text = first_choice
+            .and_then(|choice| choice.message.content.clone())
+            .unwrap_or_default();
+
+        let tool_calls = first_choice
+            .and_then(|choice| choice.message.tool_calls.as_ref())
+            .map(|tcs| convert_tool_calls(tcs));
+
+        Ok(Box::new(MistralRsResponse { text, tool_calls }))
+    }
+
+    async fn chat_stream(
+        &self,
+        messages: &[ChatMessage],
+        json_schema: Option<StructuredOutputFormat>,
+    ) -> Result<std::pin::Pin<Box<dyn Stream<Item = Result<String, LLMError>> + Send>>, LLMError>
+    {
+        let request_builder = self.build_stream_request(messages, None, json_schema)?;
+        let response_stream = Self::spawn_response_stream(self.model.clone(), request_builder);
+
+        let content_stream = response_stream.filter_map(|event| async move {
+            match event {
+                Ok(MistralStreamEvent::Chunk(chunk)) => chunk
+                    .choices
+                    .into_iter()
+                    .find_map(|choice| choice.delta.content)
+                    .filter(|content| !content.is_empty())
+                    .map(Ok),
+                Ok(MistralStreamEvent::Done(_)) => None,
+                Err(err) => Some(Err(err)),
+            }
+        });
+
+        Ok(Box::pin(content_stream))
+    }
+
+    async fn chat_stream_struct(
+        &self,
+        messages: &[ChatMessage],
+        tools: Option<&[Tool]>,
+        json_schema: Option<StructuredOutputFormat>,
+    ) -> Result<
+        std::pin::Pin<Box<dyn Stream<Item = Result<StreamResponse, LLMError>> + Send>>,
+        LLMError,
+    > {
+        let request_builder = self.build_stream_request(messages, tools, json_schema)?;
+        let response_stream = Self::spawn_response_stream(self.model.clone(), request_builder);
+
+        let struct_stream = response_stream.filter_map(|event| async move {
+            match event {
+                Ok(MistralStreamEvent::Chunk(chunk)) => {
+                    Self::chunk_to_stream_response(chunk).map(Ok)
+                }
+                Ok(MistralStreamEvent::Done(done)) => Some(Ok(Self::done_to_stream_response(done))),
+                Err(err) => Some(Err(err)),
+            }
+        });
+
+        Ok(Box::pin(struct_stream))
+    }
+
+    async fn chat_stream_with_tools(
+        &self,
+        messages: &[ChatMessage],
+        tools: Option<&[Tool]>,
+        json_schema: Option<StructuredOutputFormat>,
+    ) -> Result<Pin<Box<dyn Stream<Item = Result<StreamChunk, LLMError>> + Send>>, LLMError> {
+        let request_builder = self.build_stream_request(messages, tools, json_schema)?;
+        let response_stream = Self::spawn_response_stream(self.model.clone(), request_builder);
+
+        let stream = futures::stream::unfold(
+            ToolStreamState::new(response_stream),
+            |mut state| async move {
+                loop {
+                    if let Some(item) = state.pending.pop_front() {
+                        return Some((item, state));
+                    }
+                    if state.done_sent {
+                        return None;
+                    }
+
+                    match state.inner.as_mut().next().await {
+                        Some(Ok(MistralStreamEvent::Chunk(chunk))) => {
+                            handle_chunk_for_tool_stream(&mut state, chunk)
+                        }
+                        Some(Ok(MistralStreamEvent::Done(done))) => {
+                            handle_done_for_tool_stream(&mut state, done)
+                        }
+                        Some(Err(err)) => {
+                            state.done_sent = true;
+                            return Some((Err(err), state));
+                        }
+                        None => finalize_tool_stream(&mut state),
+                    }
+                }
+            },
+        );
+
+        Ok(Box::pin(stream))
+    }
+}
+
+#[async_trait]
+impl CompletionProvider for MistralRsProvider {
+    async fn complete(
+        &self,
+        req: &CompletionRequest,
+        _json_schema: Option<StructuredOutputFormat>,
+    ) -> Result<CompletionResponse, LLMError> {
+        // For completion, we convert it to a single user message
+        let messages = vec![ChatMessage::user().content(&req.prompt).build()];
+
+        let text_messages = convert_messages(&messages);
+
+        // Send chat request
+        let response = self
+            .model
+            .send_chat_request(text_messages)
+            .await
+            .map_err(convert_anyhow_error)?;
+
+        // Extract text from response
+        let text = response
+            .choices
+            .first()
+            .and_then(|choice| choice.message.content.clone())
+            .unwrap_or_default();
+
+        Ok(CompletionResponse { text })
+    }
+}
+
+#[async_trait]
+impl EmbeddingProvider for MistralRsProvider {
+    async fn embed(&self, _input: Vec<String>) -> Result<Vec<Vec<f32>>, LLMError> {
+        // mistral.rs TextModel doesn't support embeddings
+        // This would require a separate EmbeddingModel
+        Err(LLMError::NoToolSupport(
+            "Embedding not supported for TextModel. Use a dedicated embedding model.".to_string(),
+        ))
+    }
+}
+
+#[async_trait]
+impl ModelsProvider for MistralRsProvider {}
+
+impl LLMProvider for MistralRsProvider {}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use futures::stream;
+    use mistralrs::{
+        ChatCompletionChunkResponse, ChatCompletionResponse, Choice, ChunkChoice, Delta,
+        RequestLike, ResponseMessage, ToolCallResponse, ToolCallType, Usage as MistralUsage,
+    };
+    use serde_json::json;
+
+    fn sample_usage() -> MistralUsage {
+        MistralUsage {
+            completion_tokens: 2,
+            prompt_tokens: 1,
+            total_tokens: 3,
+            avg_tok_per_sec: 0.0,
+            avg_prompt_tok_per_sec: 0.0,
+            avg_compl_tok_per_sec: 0.0,
+            total_time_sec: 0.0,
+            total_prompt_time_sec: 0.0,
+            total_completion_time_sec: 0.0,
+        }
+    }
+
+    fn sample_tool_call(index: usize, id: &str, name: &str, arguments: &str) -> ToolCallResponse {
+        ToolCallResponse {
+            index,
+            id: id.to_string(),
+            tp: ToolCallType::Function,
+            function: CalledFunction {
+                name: name.to_string(),
+                arguments: arguments.to_string(),
+            },
+        }
+    }
+
+    fn sample_chunk(
+        choices: Vec<ChunkChoice>,
+        usage: Option<MistralUsage>,
+    ) -> ChatCompletionChunkResponse {
+        ChatCompletionChunkResponse {
+            id: "id".to_string(),
+            choices,
+            created: 0,
+            model: "model".to_string(),
+            system_fingerprint: "local".to_string(),
+            object: "chat.completion.chunk".to_string(),
+            usage,
+        }
+    }
+
+    fn sample_done(choices: Vec<Choice>, usage: MistralUsage) -> ChatCompletionResponse {
+        ChatCompletionResponse {
+            id: "id".to_string(),
+            choices,
+            created: 0,
+            model: "model".to_string(),
+            system_fingerprint: "local".to_string(),
+            object: "chat.completion".to_string(),
+            usage,
+        }
+    }
+
+    #[test]
+    fn test_convert_role_for_request() {
+        assert!(matches!(
+            convert_role_for_request(&autoagents_llm::chat::ChatRole::System),
+            TextMessageRole::System
+        ));
+        assert!(matches!(
+            convert_role_for_request(&autoagents_llm::chat::ChatRole::User),
+            TextMessageRole::User
+        ));
+        assert!(matches!(
+            convert_role_for_request(&autoagents_llm::chat::ChatRole::Assistant),
+            TextMessageRole::Assistant
+        ));
+        assert!(matches!(
+            convert_role_for_request(&autoagents_llm::chat::ChatRole::Tool),
+            TextMessageRole::User
+        ));
+    }
+
+    #[test]
+    fn test_convert_tools_and_build_request_builder_with_tools() {
+        let tool = Tool {
+            tool_type: "function".to_string(),
+            function: autoagents_llm::chat::FunctionTool {
+                name: "lookup".to_string(),
+                description: "desc".to_string(),
+                parameters: json!({
+                    "type": "object",
+                    "properties": { "q": { "type": "string" } },
+                    "required": ["q"]
+                }),
+            },
+        };
+
+        let tool_calls = vec![ToolCall {
+            id: "call_1".to_string(),
+            call_type: "function".to_string(),
+            function: FunctionCall {
+                name: "lookup".to_string(),
+                arguments: "{\"q\":\"value\"}".to_string(),
+            },
+        }];
+
+        let messages = vec![
+            ChatMessage {
+                role: autoagents_llm::chat::ChatRole::User,
+                message_type: autoagents_llm::chat::MessageType::Text,
+                content: "hello".to_string(),
+            },
+            ChatMessage {
+                role: autoagents_llm::chat::ChatRole::Assistant,
+                message_type: autoagents_llm::chat::MessageType::ToolUse(tool_calls.clone()),
+                content: "call tool".to_string(),
+            },
+            ChatMessage {
+                role: autoagents_llm::chat::ChatRole::Tool,
+                message_type: autoagents_llm::chat::MessageType::ToolResult(tool_calls),
+                content: "tool result".to_string(),
+            },
+        ];
+
+        let request = build_request_builder(&messages, Some(&[tool]), None).unwrap();
+        assert_eq!(request.messages_ref().len(), 3);
+
+        let mut request = request;
+        let tools = request.take_tools().expect("tools should be set");
+        assert_eq!(tools.0.len(), 1);
+    }
+
+    #[test]
+    fn test_build_request_builder_sets_json_schema_constraint() {
+        let messages = vec![ChatMessage {
+            role: autoagents_llm::chat::ChatRole::User,
+            message_type: autoagents_llm::chat::MessageType::Text,
+            content: "hello".to_string(),
+        }];
+
+        let schema = StructuredOutputFormat {
+            name: "Test".to_string(),
+            description: None,
+            schema: Some(json!({
+                "type": "object",
+                "properties": { "foo": { "type": "string" } },
+                "required": ["foo"]
+            })),
+            strict: Some(true),
+        };
+
+        let mut request = build_request_builder(&messages, None, Some(schema)).unwrap();
+        let constraint = request.take_constraint();
+        match constraint {
+            mistralrs::Constraint::JsonSchema(value) => {
+                assert_eq!(value.get("type"), Some(&json!("object")));
+            }
+            _ => panic!("Unexpected constraint"),
+        }
+    }
+
+    #[test]
+    fn test_chunk_to_stream_response_maps_content_and_tools() {
+        let tool_call = ToolCallResponse {
+            index: 0,
+            id: "call-1".to_string(),
+            tp: ToolCallType::Function,
+            function: CalledFunction {
+                name: "lookup".to_string(),
+                arguments: "{}".to_string(),
+            },
+        };
+
+        let chunk = ChatCompletionChunkResponse {
+            id: "id".to_string(),
+            choices: vec![ChunkChoice {
+                finish_reason: None,
+                index: 0,
+                delta: Delta {
+                    content: Some("hi".to_string()),
+                    role: "assistant".to_string(),
+                    tool_calls: Some(vec![tool_call]),
+                    reasoning_content: Some("think".to_string()),
+                },
+                logprobs: None,
+            }],
+            created: 0,
+            model: "model".to_string(),
+            system_fingerprint: "local".to_string(),
+            object: "chat.completion.chunk".to_string(),
+            usage: Some(sample_usage()),
+        };
+
+        let response = MistralRsProvider::chunk_to_stream_response(chunk).unwrap();
+        assert_eq!(response.choices.len(), 1);
+        assert_eq!(response.choices[0].delta.content.as_deref(), Some("hi"));
+        assert_eq!(
+            response.choices[0].delta.reasoning_content.as_deref(),
+            Some("think")
+        );
+        let tool_calls = response.choices[0].delta.tool_calls.as_ref().unwrap();
+        assert_eq!(tool_calls[0].function.name, "lookup");
+        assert_eq!(tool_calls[0].function.arguments, "{}");
+        assert_eq!(response.usage.unwrap().total_tokens, 3);
+    }
+
+    #[test]
+    fn test_chunk_to_stream_response_ignores_empty_chunks() {
+        let chunk = ChatCompletionChunkResponse {
+            id: "id".to_string(),
+            choices: vec![ChunkChoice {
+                finish_reason: None,
+                index: 0,
+                delta: Delta {
+                    content: None,
+                    role: "assistant".to_string(),
+                    tool_calls: None,
+                    reasoning_content: None,
+                },
+                logprobs: None,
+            }],
+            created: 0,
+            model: "model".to_string(),
+            system_fingerprint: "local".to_string(),
+            object: "chat.completion.chunk".to_string(),
+            usage: None,
+        };
+
+        assert!(MistralRsProvider::chunk_to_stream_response(chunk).is_none());
+    }
+
+    #[test]
+    fn test_done_to_stream_response_includes_usage() {
+        let response = ChatCompletionResponse {
+            id: "id".to_string(),
+            choices: vec![mistralrs::Choice {
+                finish_reason: "stop".to_string(),
+                index: 0,
+                message: ResponseMessage {
+                    content: Some("hi".to_string()),
+                    role: "assistant".to_string(),
+                    tool_calls: None,
+                    reasoning_content: None,
+                },
+                logprobs: None,
+            }],
+            created: 0,
+            model: "model".to_string(),
+            system_fingerprint: "local".to_string(),
+            object: "chat.completion".to_string(),
+            usage: sample_usage(),
+        };
+
+        let done = MistralRsProvider::done_to_stream_response(response);
+        assert_eq!(done.choices.len(), 1);
+        assert_eq!(done.usage.unwrap().total_tokens, 3);
+    }
+
+    #[test]
+    fn test_chunk_to_stream_response_keeps_usage_without_non_empty_deltas() {
+        let chunk = sample_chunk(Vec::new(), Some(sample_usage()));
+        let response = MistralRsProvider::chunk_to_stream_response(chunk)
+            .expect("usage-only chunks should still emit a response");
+        assert!(response.choices.is_empty());
+        assert_eq!(response.usage.unwrap().total_tokens, 3);
+    }
+
+    #[test]
+    fn test_tool_stream_helper_functions_cover_updates_and_completion() {
+        assert_eq!(normalize_stop_reason(None, false), "end_turn");
+        assert_eq!(normalize_stop_reason(None, true), "tool_use");
+        assert_eq!(
+            normalize_stop_reason(Some("tool_calls".to_string()), false),
+            "tool_use"
+        );
+        assert_eq!(
+            normalize_stop_reason(Some("stop".to_string()), true),
+            "end_turn"
+        );
+        assert_eq!(
+            normalize_stop_reason(Some("length".to_string()), false),
+            "length"
+        );
+
+        let state = ToolStreamState::new(Box::pin(stream::empty()));
+        assert!(state.pending.is_empty());
+        assert!(state.tool_states.is_empty());
+        assert!(state.stop_reason.is_none());
+        assert!(!state.saw_tool_use);
+        assert!(!state.usage_emitted);
+        assert!(!state.done_sent);
+
+        let default_state = ToolUseState::default();
+        assert_eq!(default_state.call_type, "function");
+        assert!(!default_state.started);
+
+        let mut pending = VecDeque::new();
+        let mut tool_states = HashMap::new();
+        let mut saw_tool_use = false;
+        push_tool_call_updates(
+            vec![
+                sample_tool_call(0, "call_1", "lookup", "{\"q\":\""),
+                sample_tool_call(0, "", "", "rust\"}"),
+            ],
+            &mut tool_states,
+            &mut pending,
+            &mut saw_tool_use,
+        );
+
+        assert!(saw_tool_use);
+        assert_eq!(tool_states[&0].id, "call_1");
+        assert_eq!(tool_states[&0].name, "lookup");
+        assert_eq!(tool_states[&0].arguments, "{\"q\":\"rust\"}");
+        assert_eq!(tool_states[&0].call_type, "function");
+
+        let emitted = pending.into_iter().collect::<Vec<_>>();
+        assert_eq!(emitted.len(), 3);
+        assert!(matches!(
+            &emitted[0],
+            Ok(StreamChunk::ToolUseStart { index, id, name })
+                if *index == 0 && id == "call_1" && name == "lookup"
+        ));
+        assert!(matches!(
+            &emitted[1],
+            Ok(StreamChunk::ToolUseInputDelta { index, partial_json })
+                if *index == 0 && partial_json == "{\"q\":\""
+        ));
+        assert!(matches!(
+            &emitted[2],
+            Ok(StreamChunk::ToolUseInputDelta { index, partial_json })
+                if *index == 0 && partial_json == "rust\"}"
+        ));
+
+        let mut state = ToolStreamState::new(Box::pin(stream::empty()));
+        state.tool_states = tool_states;
+        push_tool_completions(&mut state);
+        assert!(state.tool_states.is_empty());
+        assert_eq!(state.pending.len(), 1);
+        assert!(matches!(
+            state.pending.pop_front(),
+            Some(Ok(StreamChunk::ToolUseComplete { index, tool_call }))
+                if index == 0
+                    && tool_call.id == "call_1"
+                    && tool_call.function.name == "lookup"
+                    && tool_call.function.arguments == "{\"q\":\"rust\"}"
+        ));
+    }
+
+    #[test]
+    fn test_handle_chunk_for_tool_stream_emits_text_reasoning_tools_and_usage() {
+        let mut state = ToolStreamState::new(Box::pin(stream::empty()));
+        let chunk = sample_chunk(
+            vec![ChunkChoice {
+                finish_reason: Some("tool_calls".to_string()),
+                index: 0,
+                delta: Delta {
+                    content: Some("answer".to_string()),
+                    role: "assistant".to_string(),
+                    tool_calls: Some(vec![sample_tool_call(
+                        0,
+                        "call_1",
+                        "lookup",
+                        "{\"q\":\"rust\"}",
+                    )]),
+                    reasoning_content: Some("plan".to_string()),
+                },
+                logprobs: None,
+            }],
+            Some(sample_usage()),
+        );
+
+        handle_chunk_for_tool_stream(&mut state, chunk);
+        assert_eq!(state.stop_reason.as_deref(), Some("tool_calls"));
+        assert!(state.saw_tool_use);
+        assert!(state.usage_emitted);
+
+        let emitted = state.pending.into_iter().collect::<Vec<_>>();
+        assert_eq!(emitted.len(), 5);
+        assert!(matches!(&emitted[0], Ok(StreamChunk::Text(text)) if text == "answer"));
+        assert!(matches!(
+            &emitted[1],
+            Ok(StreamChunk::ReasoningContent(text)) if text == "plan"
+        ));
+        assert!(matches!(
+            &emitted[2],
+            Ok(StreamChunk::ToolUseStart { index, id, name })
+                if *index == 0 && id == "call_1" && name == "lookup"
+        ));
+        assert!(matches!(
+            &emitted[3],
+            Ok(StreamChunk::ToolUseInputDelta { index, partial_json })
+                if *index == 0 && partial_json == "{\"q\":\"rust\"}"
+        ));
+        assert!(matches!(
+            &emitted[4],
+            Ok(StreamChunk::Usage(usage)) if usage.total_tokens == 3
+        ));
+    }
+
+    #[test]
+    fn test_handle_done_for_tool_stream_finalizes_usage_and_tool_calls() {
+        let mut state = ToolStreamState::new(Box::pin(stream::empty()));
+        state.tool_states.insert(
+            0,
+            ToolUseState {
+                id: "call_1".to_string(),
+                name: "lookup".to_string(),
+                arguments: "{\"q\":\"Par".to_string(),
+                call_type: "function".to_string(),
+                started: true,
+            },
+        );
+        state.saw_tool_use = true;
+
+        let done = sample_done(
+            vec![Choice {
+                finish_reason: "tool_calls".to_string(),
+                index: 0,
+                message: ResponseMessage {
+                    content: None,
+                    role: "assistant".to_string(),
+                    tool_calls: Some(vec![sample_tool_call(0, "", "", "is\"}")]),
+                    reasoning_content: None,
+                },
+                logprobs: None,
+            }],
+            sample_usage(),
+        );
+
+        handle_done_for_tool_stream(&mut state, done);
+        assert!(state.done_sent);
+        assert!(state.usage_emitted);
+        assert!(state.tool_states.is_empty());
+
+        let emitted = state.pending.into_iter().collect::<Vec<_>>();
+        assert_eq!(emitted.len(), 4);
+        assert!(matches!(
+            &emitted[0],
+            Ok(StreamChunk::ToolUseInputDelta { index, partial_json })
+                if *index == 0 && partial_json == "is\"}"
+        ));
+        assert!(matches!(
+            &emitted[1],
+            Ok(StreamChunk::ToolUseComplete { index, tool_call })
+                if *index == 0
+                    && tool_call.id == "call_1"
+                    && tool_call.function.name == "lookup"
+                    && tool_call.function.arguments == "{\"q\":\"Paris\"}"
+        ));
+        assert!(matches!(
+            &emitted[2],
+            Ok(StreamChunk::Usage(usage)) if usage.total_tokens == 3
+        ));
+        assert!(matches!(
+            &emitted[3],
+            Ok(StreamChunk::Done { stop_reason }) if stop_reason == "tool_use"
+        ));
+    }
+}

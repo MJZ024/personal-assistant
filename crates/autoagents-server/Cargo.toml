@@ -1,0 +1,37 @@
+[package]
+name = "autoagents-server"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "HTTP server with Feishu Bot integration for personal assistant"
+repository.workspace = true
+keywords.workspace = true
+categories.workspace = true
+
+[[bin]]
+name = "personal-assistant"
+path = "src/main.rs"
+
+[dependencies]
+autoagents.workspace = true
+autoagents-core.workspace = true
+autoagents-llm.workspace = true
+autoagents-supervisor = { path = "../autoagents-supervisor" }
+autoagents-experts = { path = "../autoagents-experts" }
+autoagents-tool-auth = { path = "../autoagents-tool-auth" }
+autoagents-memory = { path = "../autoagents-memory" }
+axum = { version = "0.8", features = ["macros", "multipart"] }
+tower = "0.5"
+tower-http = { version = "0.6", features = ["cors", "trace", "limit"] }
+serde = { workspace = true }
+serde_json = { workspace = true }
+serde_yaml = "0.9"
+thiserror = { workspace = true }
+async-trait = { workspace = true }
+log = { workspace = true }
+env_logger = { workspace = true }
+chrono = { workspace = true }
+uuid = { workspace = true }
+reqwest = { workspace = true, features = ["json", "multipart"] }
+tokio = { workspace = true }
+bytes = { workspace = true }

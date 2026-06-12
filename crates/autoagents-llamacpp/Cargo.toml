@@ -1,0 +1,32 @@
+[package]
+name = "autoagents-llamacpp"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description.workspace = true
+repository.workspace = true
+keywords.workspace = true
+categories.workspace = true
+
+[features]
+cuda = ["llama-cpp-2/cuda"]
+cuda-no-vmm = ["llama-cpp-2/cuda-no-vmm"]
+metal = ["llama-cpp-2/metal"]
+vulkan = ["llama-cpp-2/vulkan"]
+mtmd = ["llama-cpp-2/mtmd"]
+
+[dependencies]
+llama-cpp-2 = { version = "0.1.143", default-features = false }
+autoagents-llm = { workspace = true }
+async-trait = { workspace = true }
+hf-hub = { workspace = true, default-features = false, features = ["ureq"] }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tokio = { workspace = true }
+futures = { workspace = true }
+rand = { workspace = true }
+log = { workspace = true }
+encoding_rs.workspace = true
+
+[dev-dependencies]
+tempfile = { workspace = true }

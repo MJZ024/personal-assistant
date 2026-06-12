@@ -1,0 +1,35 @@
+[Unit]
+Description=Personal Assistant - Feishu Bot AI Agent
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/personal-assistant
+Restart=always
+RestartSec=5
+StartLimitBurst=5
+StartLimitIntervalSec=60
+WorkingDirectory=/opt/personal-assistant
+Environment=ASSISTANT_CONFIG=/opt/personal-assistant/config.yaml
+Environment=RUST_LOG=info
+# Set your API keys here or in a separate env file:
+# EnvironmentFile=/opt/personal-assistant/.env
+Environment=MINIMAX_KEY=
+Environment=DEEPSEEK_KEY=
+Environment=GLM_KEY=
+
+# Security hardening
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=/opt/personal-assistant /tmp
+ReadOnlyPaths=/etc /usr
+
+# Resource limits
+MemoryMax=500M
+CPUQuota=50%
+
+[Install]
+WantedBy=multi-user.target
