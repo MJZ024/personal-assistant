@@ -410,7 +410,7 @@ checksum = "1505bd5d3d116872e7271a6d4e16d81d0c8570876c8de68093a09ac269d8aac0"
 
 [[package]]
 name = "autoagents"
-version = "0.3.7"
+version = "0.1.0"
 dependencies = [
  "async-trait",
  "autoagents-core",
@@ -424,7 +424,7 @@ dependencies = [
 
 [[package]]
 name = "autoagents-core"
-version = "0.3.7"
+version = "0.1.0"
 dependencies = [
  "async-trait",
  "autoagents-llamacpp",
@@ -458,7 +458,7 @@ dependencies = [
 
 [[package]]
 name = "autoagents-derive"
-version = "0.3.7"
+version = "0.1.0"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -471,7 +471,7 @@ dependencies = [
 
 [[package]]
 name = "autoagents-experts"
-version = "0.3.7"
+version = "0.1.0"
 dependencies = [
  "async-trait",
  "autoagents",
@@ -489,7 +489,7 @@ dependencies = [
 
 [[package]]
 name = "autoagents-guardrails"
-version = "0.3.7"
+version = "0.1.0"
 dependencies = [
  "async-trait",
  "autoagents-llm",
@@ -504,7 +504,7 @@ dependencies = [
 
 [[package]]
 name = "autoagents-guardrails-py"
-version = "0.3.7"
+version = "0.1.0"
 dependencies = [
  "autoagents-guardrails",
  "autoagents-llm",
@@ -514,7 +514,7 @@ dependencies = [
 
 [[package]]
 name = "autoagents-llamacpp"
-version = "0.3.7"
+version = "0.1.0"
 dependencies = [
  "async-trait",
  "autoagents-llm",
@@ -532,7 +532,7 @@ dependencies = [
 
 [[package]]
 name = "autoagents-llamacpp-cuda-py"
-version = "0.3.7"
+version = "0.1.0"
 dependencies = [
  "autoagents-llamacpp-py-core",
  "pyo3",
@@ -540,7 +540,7 @@ dependencies = [
 
 [[package]]
 name = "autoagents-llamacpp-metal-py"
-version = "0.3.7"
+version = "0.1.0"
 dependencies = [
  "autoagents-llamacpp-py-core",
  "pyo3",
@@ -548,7 +548,7 @@ dependencies = [
 
 [[package]]
 name = "autoagents-llamacpp-py"
-version = "0.3.7"
+version = "0.1.0"
 dependencies = [
  "autoagents-llamacpp-py-core",
  "pyo3",
@@ -556,7 +556,7 @@ dependencies = [
 
 [[package]]
 name = "autoagents-llamacpp-py-core"
-version = "0.3.7"
+version = "0.1.0"
 dependencies = [
  "autoagents-llamacpp",
  "autoagents-llm",
@@ -568,7 +568,7 @@ dependencies = [
 
 [[package]]
 name = "autoagents-llamacpp-vulkan-py"
-version = "0.3.7"
+version = "0.1.0"
 dependencies = [
  "autoagents-llamacpp-py-core",
  "pyo3",
@@ -576,7 +576,7 @@ dependencies = [
 
 [[package]]
 name = "autoagents-llm"
-version = "0.3.7"
+version = "0.1.0"
 dependencies = [
  "async-trait",
  "autoagents-protocol",
@@ -610,7 +610,7 @@ dependencies = [
 
 [[package]]
 name = "autoagents-memory"
-version = "0.3.7"
+version = "0.1.0"
 dependencies = [
  "async-trait",
  "autoagents",
@@ -628,7 +628,7 @@ dependencies = [
 
 [[package]]
 name = "autoagents-mistral-rs"
-version = "0.3.7"
+version = "0.1.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -643,7 +643,7 @@ dependencies = [
 
 [[package]]
 name = "autoagents-mistral-rs-cuda-py"
-version = "0.3.7"
+version = "0.1.0"
 dependencies = [
  "autoagents-mistral-rs-py-core",
  "pyo3",
@@ -651,7 +651,7 @@ dependencies = [
 
 [[package]]
 name = "autoagents-mistral-rs-metal-py"
-version = "0.3.7"
+version = "0.1.0"
 dependencies = [
  "autoagents-mistral-rs-py-core",
  "pyo3",
@@ -659,7 +659,7 @@ dependencies = [
 
 [[package]]
 name = "autoagents-mistral-rs-py"
-version = "0.3.7"
+version = "0.1.0"
 dependencies = [
  "autoagents-mistral-rs-py-core",
  "pyo3",
@@ -667,7 +667,7 @@ dependencies = [
 
 [[package]]
 name = "autoagents-mistral-rs-py-core"
-version = "0.3.7"
+version = "0.1.0"
 dependencies = [
  "autoagents-llm",
  "autoagents-mistral-rs",
@@ -679,7 +679,7 @@ dependencies = [
 
 [[package]]
 name = "autoagents-protocol"
-version = "0.3.7"
+version = "0.1.0"
 dependencies = [
  "serde",
  "serde_json",
@@ -688,7 +688,7 @@ dependencies = [
 
 [[package]]
 name = "autoagents-py"
-version = "0.3.7"
+version = "0.1.0"
 dependencies = [
  "async-trait",
  "autoagents-core",
@@ -711,7 +711,7 @@ dependencies = [
 
 [[package]]
 name = "autoagents-qdrant"
-version = "0.3.7"
+version = "0.1.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -728,7 +728,7 @@ dependencies = [
 
 [[package]]
 name = "autoagents-server"
-version = "0.3.7"
+version = "0.1.0"
 dependencies = [
  "async-trait",
  "autoagents",
@@ -756,7 +756,7 @@ dependencies = [
 
 [[package]]
 name = "autoagents-speech"
-version = "0.3.7"
+version = "0.1.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -785,7 +785,7 @@ dependencies = [
 
 [[package]]
 name = "autoagents-supervisor"
-version = "0.3.7"
+version = "0.1.0"
 dependencies = [
  "async-trait",
  "autoagents",
@@ -807,7 +807,7 @@ dependencies = [
 
 [[package]]
 name = "autoagents-telemetry"
-version = "0.3.7"
+version = "0.1.0"
 dependencies = [
  "async-trait",
  "autoagents-core",
@@ -831,7 +831,7 @@ dependencies = [
 
 [[package]]
 name = "autoagents-tool-auth"
-version = "0.3.7"
+version = "0.1.0"
 dependencies = [
  "async-trait",
  "autoagents",
@@ -848,7 +848,7 @@ dependencies = [
 
 [[package]]
 name = "autoagents-toolkit"
-version = "0.3.7"
+version = "0.1.0"
 dependencies = [
  "autoagents",
  "autoagents-derive",
@@ -1866,7 +1866,7 @@ dependencies = [
 
 [[package]]
 name = "code-mode-example"
-version = "0.3.7"
+version = "0.1.0"
 dependencies = [
  "autoagents",
  "autoagents-derive",
@@ -2915,7 +2915,7 @@ dependencies = [
 
 [[package]]
 name = "design_patterns"
-version = "0.3.7"
+version = "0.1.0"
 dependencies = [
  "anyhow",
  "autoagents",
@@ -4062,7 +4062,7 @@ checksum = "0cc23270f6e1808e30a928bdc84dea0b9b4136a8bc82338574f23baf47bbd280"
 
 [[package]]
 name = "guardrails-example"
-version = "0.3.7"
+version = "0.1.0"
 dependencies = [
  "anyhow",
  "autoagents",
@@ -5192,7 +5192,7 @@ dependencies = [
 
 [[package]]
 name = "llamacpp_agent"
-version = "0.3.7"
+version = "0.1.0"
 dependencies = [
  "autoagents",
  "autoagents-derive",
@@ -5206,7 +5206,7 @@ dependencies = [
 
 [[package]]
 name = "llamacpp_agent_mtmd"
-version = "0.3.7"
+version = "0.1.0"
 dependencies = [
  "autoagents",
  "autoagents-derive",
@@ -5424,7 +5424,7 @@ dependencies = [
 
 [[package]]
 name = "mcp-example"
-version = "0.3.7"
+version = "0.1.0"
 dependencies = [
  "autoagents",
  "autoagents-derive",
@@ -5580,7 +5580,7 @@ dependencies = [
 
 [[package]]
 name = "mistral_rs"
-version = "0.3.7"
+version = "0.1.0"
 dependencies = [
  "autoagents",
  "autoagents-derive",
@@ -6896,7 +6896,7 @@ checksum = "a89322df9ebe1c1578d689c92318e070967d1042b512afbe49518723f4e6d5cd"
 
 [[package]]
 name = "pipeline-example"
-version = "0.3.7"
+version = "0.1.0"
 dependencies = [
  "anyhow",
  "autoagents",
@@ -7217,7 +7217,7 @@ dependencies = [
 
 [[package]]
 name = "providers"
-version = "0.3.7"
+version = "0.1.0"
 dependencies = [
  "anyhow",
  "autoagents",
@@ -8389,7 +8389,7 @@ dependencies = [
 
 [[package]]
 name = "safe_local_agent"
-version = "0.3.7"
+version = "0.1.0"
 dependencies = [
  "anyhow",
  "autoagents",
@@ -9046,7 +9046,7 @@ dependencies = [
 
 [[package]]
 name = "speech-examples"
-version = "0.3.7"
+version = "0.1.0"
 dependencies = [
  "autoagents",
  "autoagents-derive",
@@ -9957,7 +9957,7 @@ checksum = "adb6935a6f5c20170eeceb1a3835a49e12e19d792f6dd344ccc76a985ca5a6ca"
 
 [[package]]
 name = "telemetry-example"
-version = "0.3.7"
+version = "0.1.0"
 dependencies = [
  "autoagents",
  "autoagents-derive",

@@ -1,9 +1,10 @@
 # Personal Assistant Configuration
 
 feishu:
-  app_id: "cli_xxxxxxxxxxxx"
-  app_secret: "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
-  verification_token: "xxxxxxxxxxxxxxxx"
+  # 在飞书开放平台获取: https://open.feishu.cn/
+  app_id: ""         # 替换为你的 App ID
+  app_secret: ""     # 替换为你的 App Secret
+  verification_token: ""  # 替换为你的 Verification Token
   bot_name: "个人助理"
   max_upload_size: 20971520  # 20MB
   api_base_url: "https://open.feishu.cn/open-apis"
