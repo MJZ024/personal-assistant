@@ -179,3 +179,83 @@ fn detect_priority(message: &str) -> i32 {
     }
     1 // Normal
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_command_detection() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let intent = rt.block_on(IntentClassifier::classify("/status", None)).unwrap();
+        assert!(matches!(intent, Intent::Command { .. }));
+    }
+
+    #[test]
+    fn test_new_task_coding() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let intent = rt.block_on(IntentClassifier::classify("帮我写个Python脚本处理日志", None)).unwrap();
+        match intent {
+            Intent::NewTask { task_type, .. } => assert_eq!(task_type, "coding"),
+            other => panic!("Expected NewTask(coding), got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_new_task_ops() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let intent = rt.block_on(IntentClassifier::classify("检查一下磁盘使用率", None)).unwrap();
+        match intent {
+            Intent::NewTask { task_type, .. } => assert_eq!(task_type, "ops"),
+            other => panic!("Expected NewTask(ops), got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_new_task_document() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let intent = rt.block_on(IntentClassifier::classify("把这份PDF翻译成英文", None)).unwrap();
+        match intent {
+            Intent::NewTask { task_type, .. } => assert_eq!(task_type, "document"),
+            other => panic!("Expected NewTask(document), got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_new_task_info() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let intent = rt.block_on(IntentClassifier::classify("帮我查一下深圳天气", None)).unwrap();
+        match intent {
+            Intent::NewTask { task_type, .. } => assert_eq!(task_type, "information"),
+            other => panic!("Expected NewTask(information), got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_follow_up_detection() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let task = TaskRecord::new("abc123", "写一个监控CPU温度的脚本");
+        let intent = rt.block_on(IntentClassifier::classify("再加个内存监控吧", Some(&task))).unwrap();
+        assert!(matches!(intent, Intent::FollowUp { .. }));
+    }
+
+    #[test]
+    fn test_high_priority_detection() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let intent = rt.block_on(IntentClassifier::classify("紧急！服务器挂了快看看", None)).unwrap();
+        match intent {
+            Intent::NewTask { priority, .. } => assert_eq!(priority, 2),
+            _ => panic!("Expected NewTask with priority"),
+        }
+    }
+
+    #[test]
+    fn test_normal_priority() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let intent = rt.block_on(IntentClassifier::classify("帮我写个脚本", None)).unwrap();
+        match intent {
+            Intent::NewTask { priority, .. } => assert_eq!(priority, 1),
+            _ => panic!("Expected NewTask with normal priority"),
+        }
+    }
+}

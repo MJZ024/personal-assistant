@@ -110,3 +110,54 @@ pub struct TaskDependency {
     pub task_id: String,
     pub depends_on_task_id: String,
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_task_status_to_from_str() {
+        assert_eq!(TaskStatus::from_str("pending"), TaskStatus::Pending);
+        assert_eq!(TaskStatus::from_str("in_progress"), TaskStatus::InProgress);
+        assert_eq!(TaskStatus::from_str("completed"), TaskStatus::Completed);
+        assert_eq!(TaskStatus::from_str("failed"), TaskStatus::Failed);
+        assert_eq!(TaskStatus::Pending.to_str(), "pending");
+        assert_eq!(TaskStatus::InProgress.to_str(), "in_progress");
+    }
+
+    #[test]
+    fn test_task_status_is_active() {
+        assert!(TaskStatus::Pending.is_active());
+        assert!(TaskStatus::InProgress.is_active());
+        assert!(TaskStatus::WaitingConfirmation.is_active());
+        assert!(TaskStatus::Blocked.is_active());
+        assert!(TaskStatus::Scheduled.is_active());
+        assert!(!TaskStatus::Completed.is_active());
+        assert!(!TaskStatus::Failed.is_active());
+    }
+
+    #[test]
+    fn test_task_status_is_terminal() {
+        assert!(TaskStatus::Completed.is_terminal());
+        assert!(TaskStatus::Failed.is_terminal());
+        assert!(!TaskStatus::Pending.is_terminal());
+        assert!(!TaskStatus::InProgress.is_terminal());
+    }
+
+    #[test]
+    fn test_task_record_new() {
+        let task = TaskRecord::new("t1", "test task");
+        assert_eq!(task.id, "t1");
+        assert_eq!(task.description, "test task");
+        assert_eq!(task.status, TaskStatus::Pending);
+        assert_eq!(task.priority, 1);
+        assert_eq!(task.progress_pct, 0);
+    }
+
+    #[test]
+    fn test_task_priority_ordering() {
+        assert!(TaskPriority::Low < TaskPriority::Normal);
+        assert!(TaskPriority::Normal < TaskPriority::High);
+        assert!(TaskPriority::High < TaskPriority::Critical);
+    }
+}
