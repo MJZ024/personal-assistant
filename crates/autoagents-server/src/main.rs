@@ -6,6 +6,7 @@
 
 mod config;
 mod feishu;
+mod llm_provider;
 mod runner;
 
 use std::sync::Arc;
@@ -55,6 +56,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Initialize Feishu client
     let feishu_client = Arc::new(FeishuClient::new(app_config.feishu.clone()));
 
+    // Build the primary LLM provider for expert agents (currently everyone
+    // shares the same provider type — MiniMax or DeepSeek — using the
+    // "coding" agent's config as the representative; fallback routing and
+    // per-agent providers are future work).
+    let expert_llm = llm_provider::build_primary_llm("coding", &app_config.models)?;
+    log::info!("LLM provider initialized");
+
+    // Build ExpertContext shared by all expert agents.
+    let expert_ctx = runner::make_expert_context(auth.clone(), "/tmp/personal-assistant-workspace");
+
     // Start heartbeat
     let heartbeat_db = database.clone();
     let heartbeat_config = HeartbeatConfig {
@@ -75,6 +86,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         feishu_client: feishu_client.clone(),
         supervisor: supervisor.clone(),
         config: Arc::new(app_config.feishu.clone()),
+        expert_llm: Some(expert_llm),
+        expert_ctx: Some(expert_ctx),
     };
 
     let app = Router::new()

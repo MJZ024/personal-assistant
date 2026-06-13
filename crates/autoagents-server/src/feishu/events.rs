@@ -1,10 +1,15 @@
 //! Feishu event subscription handler.
 
+use std::sync::Arc;
+
 use axum::extract::State;
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Json, Response};
 use bytes::Bytes;
 use serde_json::Value;
+
+use autoagents_experts::ExpertContext;
+use autoagents_llm::LLMProvider;
 
 use super::security::{AuthOutcome, authenticate};
 use super::types::*;
@@ -15,6 +20,10 @@ pub struct AppState {
     pub feishu_client: std::sync::Arc<super::api::FeishuClient>,
     pub supervisor: std::sync::Arc<tokio::sync::Mutex<autoagents_supervisor::Supervisor>>,
     pub config: std::sync::Arc<super::FeishuConfig>,
+    /// LLM provider for expert agents (None if no API key is configured).
+    pub expert_llm: Option<Arc<dyn LLMProvider>>,
+    /// Shared context for expert agent execution (None if no LLM is configured).
+    pub expert_ctx: Option<Arc<ExpertContext>>,
 }
 
 /// Feishu event callback endpoint.
@@ -177,6 +186,44 @@ async fn handle_incoming_message(state: &AppState, sender_id: &str, message: Opt
     let mut supervisor = state.supervisor.lock().await;
     match supervisor.handle_message(sender_id, &content_text).await {
         Ok(response) => {
+            // If this is a new task, spawn the expert agent to actually do the
+            // work. The result will be pushed back asynchronously.
+            if let (Some(llm), Some(ctx)) = (&state.expert_llm, &state.expert_ctx) {
+                if let (Some(tid), Some(ttype), Some(desc)) = (
+                    response.task_id.clone(),
+                    response.task_type.clone(),
+                    response.description.clone(),
+                ) {
+                    let req = crate::runner::RunRequest {
+                        task_id: tid,
+                        task_type: ttype,
+                        description: desc,
+                        llm: llm.clone(),
+                        context: ctx.clone(),
+                    };
+                    let fc = state.feishu_client.clone();
+                    let chat = chat_id.to_string();
+                    crate::runner::spawn_expert(req, move |outcome| {
+                        let msg = if outcome.success {
+                            format!(
+                                "任务完成 ({})\n\n{}",
+                                &outcome.task_id[..8],
+                                outcome.response
+                            )
+                        } else {
+                            format!(
+                                "任务失败 ({})\n\n{}",
+                                &outcome.task_id[..8],
+                                outcome.response
+                            )
+                        };
+                        tokio::spawn(async move {
+                            let _ = fc.send_text_message(&chat, &msg).await;
+                        });
+                    });
+                }
+            }
+
             let reply_text = if let Some(ref task_id) = response.task_id {
                 format!("{}\n\n任务ID: {}", response.message, &task_id[..8])
             } else {
@@ -310,6 +357,8 @@ mod router_tests {
             feishu_client,
             supervisor,
             config: Arc::new(config),
+            expert_llm: None,
+            expert_ctx: None,
         };
         Router::new()
             .route("/feishu/event", post(event_callback))

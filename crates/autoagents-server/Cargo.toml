@@ -15,7 +15,7 @@ path = "src/main.rs"
 [dependencies]
 autoagents.workspace = true
 autoagents-core.workspace = true
-autoagents-llm.workspace = true
+autoagents-llm = { workspace = true, features = ["minimax", "deepseek"] }
 autoagents-supervisor = { path = "../autoagents-supervisor" }
 autoagents-experts = { path = "../autoagents-experts" }
 autoagents-tool-auth = { path = "../autoagents-tool-auth" }

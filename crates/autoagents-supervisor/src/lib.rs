@@ -76,21 +76,24 @@ impl Supervisor {
         let existing_task = session.get_active_task().cloned();
 
         // 2. Classify intent
-        let intent = self.classify_intent(message, existing_task.as_ref()).await?;
+        let intent = self
+            .classify_intent(message, existing_task.as_ref())
+            .await?;
 
         match intent {
-            Intent::NewTask { task_type, description, priority } => {
-                self.dispatch_new_task(user_id, &task_type, &description, priority).await
+            Intent::NewTask {
+                task_type,
+                description,
+                priority,
+            } => {
+                self.dispatch_new_task(user_id, &task_type, &description, priority)
+                    .await
             }
             Intent::FollowUp { task_id, message } => {
                 self.handle_follow_up(&task_id, &message).await
             }
-            Intent::Command { command } => {
-                self.handle_command(user_id, &command).await
-            }
-            Intent::Query { question } => {
-                self.handle_query(&question).await
-            }
+            Intent::Command { command } => self.handle_command(user_id, &command).await,
+            Intent::Query { question } => self.handle_query(&question).await,
         }
     }
 
@@ -100,7 +103,8 @@ impl Supervisor {
         message: &str,
         active_task: Option<&TaskRecord>,
     ) -> Result<Intent, SupervisorError> {
-        IntentClassifier::classify(message, active_task).await
+        IntentClassifier::classify(message, active_task)
+            .await
             .map_err(|e| SupervisorError::IntentError(e))
     }
 
@@ -141,13 +145,16 @@ impl Supervisor {
                     "收到任务「{}」，当前有 {} 个任务正在执行，已加入队列等待。",
                     description, self.active_count
                 ),
-                task_id: Some(task_id),
+                task_id: Some(task_id.clone()),
+                task_type: Some(task_type.to_string()),
+                description: Some(description.to_string()),
                 requires_confirmation: false,
             });
         }
 
         // Dispatch immediately
-        self.start_task_execution(task_id.clone(), description, task_type).await?;
+        self.start_task_execution(task_id.clone(), description, task_type)
+            .await?;
 
         Ok(SupervisorResponse {
             message: format!(
@@ -156,6 +163,8 @@ impl Supervisor {
                 task_type_to_display(task_type)
             ),
             task_id: Some(task_id),
+            task_type: Some(task_type.to_string()),
+            description: Some(description.to_string()),
             requires_confirmation: false,
         })
     }
@@ -170,13 +179,17 @@ impl Supervisor {
         self.active_count += 1;
 
         // Update task status
-        let mut task = self.database.get_task(&task_id)?
+        let mut task = self
+            .database
+            .get_task(&task_id)?
             .ok_or(SupervisorError::TaskNotFound(task_id.clone()))?;
         task.status = TaskStatus::InProgress;
         task.agent_type = Some(task_type.to_string());
         self.database.upsert_task(&task)?;
 
-        self.dispatcher.dispatch(&task_id, task_type, description).await?;
+        self.dispatcher
+            .dispatch(&task_id, task_type, description)
+            .await?;
 
         Ok(())
     }
@@ -187,7 +200,9 @@ impl Supervisor {
         task_id: &str,
         message: &str,
     ) -> Result<SupervisorResponse, SupervisorError> {
-        let task = self.database.get_task(task_id)?
+        let task = self
+            .database
+            .get_task(task_id)?
             .ok_or(SupervisorError::TaskNotFound(task_id.to_string()))?;
 
         // Route the follow-up to the expert agent
@@ -196,6 +211,8 @@ impl Supervisor {
         Ok(SupervisorResponse {
             message: "已收到，正在处理...".to_string(),
             task_id: Some(task_id.to_string()),
+            task_type: None,
+            description: None,
             requires_confirmation: false,
         })
     }
@@ -211,25 +228,28 @@ impl Supervisor {
             "/help" => Ok(SupervisorResponse {
                 message: "可用命令:\n/status - 查看系统状态\n/help - 显示帮助\n/reload - 重新加载配置\n/tasks - 查看当前任务".into(),
                 task_id: None,
-                requires_confirmation: false,
+                task_type: None,
+            description: None,
+            requires_confirmation: false,
             }),
             "/tasks" => self.list_active_tasks(),
             _ => Ok(SupervisorResponse {
                 message: format!("未知命令: {}。输入 /help 查看可用命令。", command),
                 task_id: None,
-                requires_confirmation: false,
+                task_type: None,
+            description: None,
+            requires_confirmation: false,
             }),
         }
     }
 
     /// Handle a general query.
-    async fn handle_query(
-        &self,
-        question: &str,
-    ) -> Result<SupervisorResponse, SupervisorError> {
+    async fn handle_query(&self, question: &str) -> Result<SupervisorResponse, SupervisorError> {
         Ok(SupervisorResponse {
             message: format!("收到你的问题，我来处理: {}", question),
             task_id: None,
+            task_type: None,
+            description: None,
             requires_confirmation: false,
         })
     }
@@ -244,13 +264,23 @@ impl Supervisor {
             self.config.max_concurrent_tasks,
         );
 
-        let detail: Vec<String> = active_tasks.iter().map(|t| {
-            format!("- [{}] {} ({})", t.status.to_str(), t.description, t.agent_type.as_deref().unwrap_or("unknown"))
-        }).collect();
+        let detail: Vec<String> = active_tasks
+            .iter()
+            .map(|t| {
+                format!(
+                    "- [{}] {} ({})",
+                    t.status.to_str(),
+                    t.description,
+                    t.agent_type.as_deref().unwrap_or("unknown")
+                )
+            })
+            .collect();
 
         Ok(SupervisorResponse {
             message: format!("{}\n\n当前任务:\n{}", msg, detail.join("\n")),
             task_id: None,
+            task_type: None,
+            description: None,
             requires_confirmation: false,
         })
     }
@@ -262,18 +292,31 @@ impl Supervisor {
             return Ok(SupervisorResponse {
                 message: "当前没有活跃任务。".into(),
                 task_id: None,
+                task_type: None,
+                description: None,
                 requires_confirmation: false,
             });
         }
 
-        let lines: Vec<String> = tasks.iter().enumerate().map(|(i, t)| {
-            format!("{}. [{}] {} (进度: {}%)",
-                i + 1, t.id[..8].to_string(), t.description, t.progress_pct)
-        }).collect();
+        let lines: Vec<String> = tasks
+            .iter()
+            .enumerate()
+            .map(|(i, t)| {
+                format!(
+                    "{}. [{}] {} (进度: {}%)",
+                    i + 1,
+                    t.id[..8].to_string(),
+                    t.description,
+                    t.progress_pct
+                )
+            })
+            .collect();
 
         Ok(SupervisorResponse {
             message: format!("当前任务:\n{}", lines.join("\n")),
             task_id: None,
+            task_type: None,
+            description: None,
             requires_confirmation: false,
         })
     }
@@ -288,10 +331,16 @@ impl Supervisor {
     ) -> Result<(), SupervisorError> {
         self.active_count = self.active_count.saturating_sub(1);
 
-        let mut task = self.database.get_task(task_id)?
+        let mut task = self
+            .database
+            .get_task(task_id)?
             .ok_or(SupervisorError::TaskNotFound(task_id.to_string()))?;
 
-        task.status = if success { TaskStatus::Completed } else { TaskStatus::Failed };
+        task.status = if success {
+            TaskStatus::Completed
+        } else {
+            TaskStatus::Failed
+        };
         task.result_summary = Some(result.to_string());
         self.database.upsert_task(&task)?;
 
@@ -306,11 +355,17 @@ impl Supervisor {
     pub async fn dispatch_queue(&mut self) -> Result<(), SupervisorError> {
         while self.active_count < self.config.max_concurrent_tasks {
             if let Some(task_id) = self.pending_queue.pop() {
-                let task = self.database.get_task(&task_id)?
+                let task = self
+                    .database
+                    .get_task(&task_id)?
                     .ok_or_else(|| SupervisorError::TaskNotFound(task_id.clone()))?;
 
-                let task_type = task.agent_type.clone().unwrap_or_else(|| "coding".to_string());
-                self.start_task_execution(task_id, &task.description, &task_type).await?;
+                let task_type = task
+                    .agent_type
+                    .clone()
+                    .unwrap_or_else(|| "coding".to_string());
+                self.start_task_execution(task_id, &task.description, &task_type)
+                    .await?;
             } else {
                 break;
             }
@@ -361,6 +416,10 @@ fn task_type_to_display(task_type: &str) -> &str {
 pub struct SupervisorResponse {
     pub message: String,
     pub task_id: Option<String>,
+    /// Classified task type ("coding", "ops", …) — set for NewTask.
+    pub task_type: Option<String>,
+    /// Original user description — set for NewTask.
+    pub description: Option<String>,
     pub requires_confirmation: bool,
 }
 
