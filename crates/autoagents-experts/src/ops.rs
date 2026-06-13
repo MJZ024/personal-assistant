@@ -8,6 +8,7 @@ use autoagents_core::tool::{ToolCallError, ToolRuntime, ToolT};
 
 use autoagents_tool_auth::PermissionLevel;
 
+use super::redact::redact_secrets;
 use super::ExpertAgent;
 
 // ── Agent Definition ──
@@ -194,14 +195,35 @@ impl ToolRuntime for ServiceControlTool {
             .ok_or(ToolCallError::RuntimeError("service_name required".into()))?;
 
         if action != "status" {
-            if let Some(ref auth) = self.auth {
-                let check = auth.check("ops", "service_control", PermissionLevel::System);
-                if check.needs_confirmation() {
-                    return Err(ToolCallError::RuntimeError(
-                        "Service control requires user confirmation.".into(),
-                    ));
-                }
+            // Fail closed: without an auth interceptor, refuse rather than
+            // run a mutating service action unchecked.
+            let auth = self
+                .auth
+                .as_ref()
+                .ok_or(ToolCallError::RuntimeError("auth not configured".into()))?;
+            let check = auth.check("ops", "service_control", PermissionLevel::System);
+            let args = format!("{action} {service}");
+            if check.needs_confirmation() {
+                super::record_audit(
+                    auth,
+                    "ops",
+                    "service_control",
+                    PermissionLevel::System,
+                    &args,
+                    "blocked",
+                );
+                return Err(ToolCallError::RuntimeError(
+                    "Service control requires user confirmation.".into(),
+                ));
             }
+            super::record_audit(
+                auth,
+                "ops",
+                "service_control",
+                PermissionLevel::System,
+                &args,
+                "allowed",
+            );
         }
 
         let output = tokio::process::Command::new("systemctl")
@@ -280,7 +302,7 @@ impl ToolRuntime for LogViewTool {
         };
 
         let output = output.map_err(|e| ToolCallError::RuntimeError(e.to_string().into()))?;
-        let log_text = String::from_utf8_lossy(&output.stdout);
+        let log_text = redact_secrets(&String::from_utf8_lossy(&output.stdout));
         Ok(serde_json::json!({ "log": log_text, "line_count": log_text.lines().count() }))
     }
 }
@@ -395,18 +417,39 @@ impl ToolRuntime for ProcessManageTool {
                 Ok(serde_json::json!({ "processes": procs }))
             }
             "kill" => {
-                if let Some(ref auth) = self.auth {
-                    let check = auth.check("ops", "process_manage", PermissionLevel::System);
-                    if check.needs_confirmation() {
-                        return Err(ToolCallError::RuntimeError(
-                            "Killing processes requires user confirmation.".into(),
-                        ));
-                    }
-                }
+                // Fail closed: without an auth interceptor, refuse rather
+                // than signal a process unchecked.
                 let pid = args["pid"]
                     .as_u64()
                     .ok_or(ToolCallError::RuntimeError("pid required".into()))?;
                 let signal = args["signal"].as_str().unwrap_or("SIGTERM");
+                let auth = self
+                    .auth
+                    .as_ref()
+                    .ok_or(ToolCallError::RuntimeError("auth not configured".into()))?;
+                let check = auth.check("ops", "process_manage", PermissionLevel::System);
+                let args_str = format!("kill -s {signal} {pid}");
+                if check.needs_confirmation() {
+                    super::record_audit(
+                        auth,
+                        "ops",
+                        "process_manage",
+                        PermissionLevel::System,
+                        &args_str,
+                        "blocked",
+                    );
+                    return Err(ToolCallError::RuntimeError(
+                        "Killing processes requires user confirmation.".into(),
+                    ));
+                }
+                super::record_audit(
+                    auth,
+                    "ops",
+                    "process_manage",
+                    PermissionLevel::System,
+                    &args_str,
+                    "allowed",
+                );
 
                 let output = tokio::process::Command::new("kill")
                     .args(["-s", signal, &pid.to_string()])
@@ -420,5 +463,39 @@ impl ToolRuntime for ProcessManageTool {
             }
             _ => Err(ToolCallError::RuntimeError("Invalid action".into())),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn process_kill_fails_closed_without_auth() {
+        let tool = ProcessManageTool::new(None);
+        let res = tool
+            .execute(serde_json::json!({"action": "kill", "pid": 1}))
+            .await;
+        assert!(res.is_err(), "kill must refuse when auth is None");
+    }
+
+    #[tokio::test]
+    async fn process_kill_with_auth_is_blocked_and_audited() {
+        let path = "/tmp/pa-test-audit-ops.log";
+        let _ = std::fs::remove_file(path);
+        let mut cfg = autoagents_tool_auth::ToolAuthConfig::default();
+        cfg.audit_log_path = path.into();
+        let auth = std::sync::Arc::new(
+            autoagents_tool_auth::ToolAuthInterceptor::new(cfg).expect("interceptor"),
+        );
+        let tool = ProcessManageTool::new(Some(auth));
+        // System-level op under the (currently dead-letter) confirmation gate.
+        let res = tool
+            .execute(serde_json::json!({"action": "kill", "pid": 99999}))
+            .await;
+        assert!(res.is_err(), "kill must be blocked by the confirmation gate");
+        let audit = std::fs::read_to_string(path).expect("audit log written");
+        assert!(audit.contains("process_manage"), "audit missing tool: {audit}");
+        assert!(audit.contains("blocked"), "audit missing result: {audit}");
     }
 }

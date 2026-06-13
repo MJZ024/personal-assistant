@@ -481,6 +481,7 @@ dependencies = [
  "autoagents-tool-auth",
  "autoagents-toolkit",
  "log",
+ "regex",
  "serde",
  "serde_json",
  "thiserror 2.0.18",

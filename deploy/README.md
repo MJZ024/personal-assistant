@@ -23,6 +23,19 @@ echo 'DEEPSEEK_KEY=your-deepseek-key' | sudo tee -a /opt/personal-assistant/.env
 echo 'GLM_KEY=your-glm-key' | sudo tee -a /opt/personal-assistant/.env
 ```
 
+### 系统依赖：bubblewrap（沙箱）
+
+Coding Agent 的 shell 命令在 `bubblewrap` 沙箱中执行——无网络、根文件系统只读、只有工作目录可写，`/opt/personal-assistant` 和 `~/.ssh` 等对沙箱不可见。这样即使危险度分析被绕过，也读不到密钥、发不出网络。服务端默认 `SandboxPolicy::Required`，**未安装 bwrap 时 shell 工具一律拒绝执行（fail-closed）**。
+
+在 1037U 上安装并验证：
+
+```bash
+sudo apt update && sudo apt install -y bubblewrap
+bwrap --version
+```
+
+> REPL（本地 `--repl`）默认 `Auto`：有 bwrap 就沙箱，没有就退化为普通 shell 并打日志，方便在开发机上使用。
+
 ## 编译和部署
 
 在 MacBook 上:

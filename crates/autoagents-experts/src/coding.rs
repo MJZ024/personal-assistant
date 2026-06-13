@@ -8,6 +8,8 @@ use autoagents_core::tool::{ToolCallError, ToolRuntime, ToolT};
 
 use autoagents_tool_auth::{PermissionLevel, ShellDangerLevel};
 
+use super::redact::redact_secrets;
+use super::sandbox::{resolve_argv, SandboxPolicy};
 use super::ExpertAgent;
 
 // ── Agent Definition ──
@@ -16,6 +18,7 @@ use super::ExpertAgent;
 pub struct CodingAgent {
     auth: Option<Arc<autoagents_tool_auth::ToolAuthInterceptor>>,
     working_dir: String,
+    sandbox: SandboxPolicy,
 }
 
 impl CodingAgent {
@@ -23,6 +26,7 @@ impl CodingAgent {
         Self {
             auth: None,
             working_dir: String::new(),
+            sandbox: SandboxPolicy::Required,
         }
     }
 
@@ -50,14 +54,18 @@ impl AgentDeriveT for CodingAgent {
 
     fn tools(&self) -> Vec<Box<dyn ToolT>> {
         vec![
-            Box::new(ShellExecuteTool::new(self.auth.clone())),
+            Box::new(ShellExecuteTool::new(
+                self.auth.clone(),
+                self.working_dir.clone(),
+                self.sandbox,
+            )),
             Box::new(ReadFileTool::new(self.working_dir.clone())),
             Box::new(WriteFileTool::new(
                 self.auth.clone(),
                 self.working_dir.clone(),
             )),
             Box::new(GitOperationTool::new(self.auth.clone())),
-            Box::new(CodeSearchTool),
+            Box::new(CodeSearchTool::new(self.working_dir.clone())),
         ]
     }
 }
@@ -76,6 +84,7 @@ impl ExpertAgent for CodingAgent {
     async fn init(&mut self, ctx: Arc<super::ExpertContext>) {
         self.auth = Some(ctx.auth.clone());
         self.working_dir = ctx.working_dir.clone();
+        self.sandbox = ctx.sandbox;
     }
 }
 
@@ -84,11 +93,21 @@ impl ExpertAgent for CodingAgent {
 #[derive(Debug, Clone)]
 pub struct ShellExecuteTool {
     auth: Option<Arc<autoagents_tool_auth::ToolAuthInterceptor>>,
+    working_dir: String,
+    sandbox: SandboxPolicy,
 }
 
 impl ShellExecuteTool {
-    pub fn new(auth: Option<Arc<autoagents_tool_auth::ToolAuthInterceptor>>) -> Self {
-        Self { auth }
+    pub fn new(
+        auth: Option<Arc<autoagents_tool_auth::ToolAuthInterceptor>>,
+        working_dir: String,
+        sandbox: SandboxPolicy,
+    ) -> Self {
+        Self {
+            auth,
+            working_dir,
+            sandbox,
+        }
     }
 }
 
@@ -118,34 +137,55 @@ impl ToolRuntime for ShellExecuteTool {
         let command = args["command"]
             .as_str()
             .ok_or(ToolCallError::RuntimeError("command required".into()))?;
-        let working_dir = args["working_dir"].as_str().unwrap_or("/tmp");
-        let timeout_secs = args["timeout_secs"].as_u64().unwrap_or(30);
 
-        if let Some(ref auth) = self.auth {
-            let (level, warning) = auth.analyze_shell_command(command);
-            if level == ShellDangerLevel::Unknown || level >= ShellDangerLevel::System {
-                return Err(ToolCallError::RuntimeError(
-                    format!(
-                        "Command blocked (level: {:?}): {}. User confirmation required.",
-                        level,
-                        warning.unwrap_or_default()
-                    )
-                    .into(),
-                ));
-            }
+        // Fail-closed danger gate: with no auth interceptor configured we
+        // refuse to run anything rather than running unchecked.
+        let auth = self
+            .auth
+            .as_ref()
+            .ok_or(ToolCallError::RuntimeError("auth not configured".into()))?;
+        let (level, warning) = auth.analyze_shell_command(command);
+        let perm = match level {
+            ShellDangerLevel::Safe => PermissionLevel::Safe,
+            ShellDangerLevel::Write => PermissionLevel::Write,
+            _ => PermissionLevel::System,
+        };
+        if level == ShellDangerLevel::Unknown || level >= ShellDangerLevel::System {
+            super::record_audit(auth, "coding", "shell_execute", perm, command, "blocked");
+            return Err(ToolCallError::RuntimeError(
+                format!(
+                    "Command blocked (level: {:?}): {}. User confirmation required.",
+                    level,
+                    warning.unwrap_or_default()
+                )
+                .into(),
+            ));
         }
+        super::record_audit(auth, "coding", "shell_execute", perm, command, "allowed");
 
-        let output = tokio::process::Command::new("sh")
-            .arg("-c")
-            .arg(command)
-            .current_dir(working_dir)
+        // Confine execution to the agent's working directory under the
+        // configured sandbox policy. The per-call `working_dir` arg is
+        // intentionally ignored so the LLM cannot relocate execution outside
+        // the sandboxed bind.
+        let workdir = if self.working_dir.is_empty() {
+            "/tmp".to_string()
+        } else {
+            self.working_dir.clone()
+        };
+        let home = std::env::var("HOME").ok();
+        let argv = resolve_argv(self.sandbox, &workdir, home.as_deref(), command)
+            .map_err(|e| ToolCallError::RuntimeError(e.into()))?;
+
+        let output = tokio::process::Command::new(&argv[0])
+            .args(&argv[1..])
+            .current_dir(&workdir)
             .output()
             .await
             .map_err(|e| ToolCallError::RuntimeError(e.to_string().into()))?;
 
         Ok(serde_json::json!({
-            "stdout": String::from_utf8_lossy(&output.stdout),
-            "stderr": String::from_utf8_lossy(&output.stderr),
+            "stdout": redact_secrets(&String::from_utf8_lossy(&output.stdout)),
+            "stderr": redact_secrets(&String::from_utf8_lossy(&output.stderr)),
             "exit_code": output.status.code(),
             "success": output.status.success(),
         }))
@@ -204,7 +244,7 @@ impl ToolRuntime for ReadFileTool {
             .map_err(|e| ToolCallError::RuntimeError(e.to_string().into()))?;
         let lines: Vec<&str> = contents.lines().take(max_lines).collect();
 
-        Ok(serde_json::json!({ "path": path, "lines": lines.len(), "content": lines.join("\n") }))
+        Ok(serde_json::json!({ "path": path, "lines": lines.len(), "content": redact_secrets(&lines.join("\n")) }))
     }
 }
 
@@ -317,6 +357,38 @@ impl ToolRuntime for GitOperationTool {
             .as_str()
             .ok_or(ToolCallError::RuntimeError("repo_path required".into()))?;
 
+        // `push` exfiltrates code and mutates the remote — gate it, and fail
+        // closed when no auth interceptor is configured.
+        if operation == "push" {
+            let auth = self
+                .auth
+                .as_ref()
+                .ok_or(ToolCallError::RuntimeError("auth not configured".into()))?;
+            let check = auth.check("coding", "git_push", PermissionLevel::System);
+            let args = format!("push {repo_path}");
+            if check.needs_confirmation() {
+                super::record_audit(
+                    auth,
+                    "coding",
+                    "git_push",
+                    PermissionLevel::System,
+                    &args,
+                    "blocked",
+                );
+                return Err(ToolCallError::RuntimeError(
+                    "git push requires user confirmation.".into(),
+                ));
+            }
+            super::record_audit(
+                auth,
+                "coding",
+                "git_push",
+                PermissionLevel::System,
+                &args,
+                "allowed",
+            );
+        }
+
         let mut cmd = tokio::process::Command::new("git");
         cmd.arg(operation).current_dir(repo_path);
 
@@ -343,7 +415,15 @@ impl ToolRuntime for GitOperationTool {
 // ── Code Search Tool ──
 
 #[derive(Debug, Clone)]
-pub struct CodeSearchTool;
+pub struct CodeSearchTool {
+    working_dir: String,
+}
+
+impl CodeSearchTool {
+    pub fn new(working_dir: String) -> Self {
+        Self { working_dir }
+    }
+}
 
 impl ToolT for CodeSearchTool {
     fn name(&self) -> &str {
@@ -376,8 +456,16 @@ impl ToolRuntime for CodeSearchTool {
             .ok_or(ToolCallError::RuntimeError("directory required".into()))?;
         let file_pattern = args["file_pattern"].as_str();
 
+        // Confine the search root the same way read_file/write_file are, so
+        // the LLM cannot grep across secret-bearing directories.
+        let policy = super::path_policy::PathPolicy::for_coding(Some(&self.working_dir));
+        let safe_dir = policy.validate_resolved(directory).map_err(|e| {
+            ToolCallError::RuntimeError(format!("directory '{directory}' rejected: {e:?}").into())
+        })?;
+
         let mut cmd = tokio::process::Command::new("grep");
-        cmd.args(["-rn", "-E", pattern, directory]);
+        cmd.args(["-rn", "-E", pattern]);
+        cmd.arg(safe_dir.as_os_str());
         if let Some(fp) = file_pattern {
             cmd.args(["--include", fp]);
         }
@@ -387,7 +475,7 @@ impl ToolRuntime for CodeSearchTool {
             .await
             .map_err(|e| ToolCallError::RuntimeError(e.to_string().into()))?;
 
-        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stdout = redact_secrets(&String::from_utf8_lossy(&output.stdout));
         let matches: Vec<&str> = stdout.lines().take(100).collect();
 
         Ok(serde_json::json!({
@@ -395,5 +483,57 @@ impl ToolRuntime for CodeSearchTool {
             "total": stdout.lines().count(),
             "truncated": stdout.lines().count() > 100,
         }))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use autoagents_tool_auth::{ToolAuthConfig, ToolAuthInterceptor};
+    use std::sync::Arc;
+
+    fn test_auth() -> Arc<ToolAuthInterceptor> {
+        // AuditLogger opens its log path, so point it somewhere writable.
+        let mut cfg = ToolAuthConfig::default();
+        cfg.audit_log_path = "/tmp/pa-test-audit.log".into();
+        Arc::new(ToolAuthInterceptor::new(cfg).expect("interceptor"))
+    }
+
+    #[tokio::test]
+    async fn git_push_fails_closed_without_auth() {
+        let tool = GitOperationTool::new(None);
+        let res = tool
+            .execute(serde_json::json!({"operation":"push","repo_path":"/tmp"}))
+            .await;
+        assert!(res.is_err(), "git push must refuse when auth is None");
+    }
+
+    #[tokio::test]
+    async fn git_push_blocked_by_gate_with_auth() {
+        // coding agent cap is System; push is gated at System, which the
+        // (currently dead-letter) confirmation turns into a refusal.
+        let tool = GitOperationTool::new(Some(test_auth()));
+        let res = tool
+            .execute(serde_json::json!({"operation":"push","repo_path":"/tmp"}))
+            .await;
+        assert!(res.is_err(), "git push must pass through the auth gate");
+    }
+
+    #[tokio::test]
+    async fn code_search_rejects_secret_directory() {
+        let tool = CodeSearchTool::new("/home/me/repo".into());
+        let res = tool
+            .execute(serde_json::json!({"pattern":"KEY","directory":"/opt/personal-assistant"}))
+            .await;
+        assert!(res.is_err(), "code_search must refuse the secrets dir");
+    }
+
+    #[tokio::test]
+    async fn code_search_rejects_path_traversal() {
+        let tool = CodeSearchTool::new("/home/me/repo".into());
+        let res = tool
+            .execute(serde_json::json!({"pattern":"x","directory":"../../../etc"}))
+            .await;
+        assert!(res.is_err(), "code_search must reject traversal outside root");
     }
 }
