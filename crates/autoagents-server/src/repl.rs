@@ -38,7 +38,11 @@ pub async fn run(app_config: AppConfig, auth: Arc<ToolAuthInterceptor>) {
         }
     };
 
-    let expert_ctx = crate::runner::make_expert_context(auth, "/tmp/personal-assistant-workspace");
+    let expert_ctx = crate::runner::make_expert_context(
+        auth,
+        "/tmp/personal-assistant-workspace",
+        autoagents_experts::sandbox::SandboxPolicy::Auto,
+    );
 
     println!("Personal Assistant REPL");
     println!("Model:  coding agent → {}", describe_model(&app_config));

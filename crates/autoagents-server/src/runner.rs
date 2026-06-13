@@ -41,10 +41,12 @@ pub struct RunOutcome {
 pub fn make_expert_context(
     auth: Arc<ToolAuthInterceptor>,
     working_dir: &str,
+    sandbox: autoagents_experts::sandbox::SandboxPolicy,
 ) -> Arc<ExpertContext> {
     Arc::new(ExpertContext {
         auth,
         working_dir: working_dir.to_string(),
+        sandbox,
     })
 }
 

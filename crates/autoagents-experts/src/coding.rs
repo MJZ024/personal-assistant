@@ -8,6 +8,7 @@ use autoagents_core::tool::{ToolCallError, ToolRuntime, ToolT};
 
 use autoagents_tool_auth::{PermissionLevel, ShellDangerLevel};
 
+use super::sandbox::{resolve_argv, SandboxPolicy};
 use super::ExpertAgent;
 
 // ── Agent Definition ──
@@ -16,6 +17,7 @@ use super::ExpertAgent;
 pub struct CodingAgent {
     auth: Option<Arc<autoagents_tool_auth::ToolAuthInterceptor>>,
     working_dir: String,
+    sandbox: SandboxPolicy,
 }
 
 impl CodingAgent {
@@ -23,6 +25,7 @@ impl CodingAgent {
         Self {
             auth: None,
             working_dir: String::new(),
+            sandbox: SandboxPolicy::Required,
         }
     }
 
@@ -50,7 +53,11 @@ impl AgentDeriveT for CodingAgent {
 
     fn tools(&self) -> Vec<Box<dyn ToolT>> {
         vec![
-            Box::new(ShellExecuteTool::new(self.auth.clone())),
+            Box::new(ShellExecuteTool::new(
+                self.auth.clone(),
+                self.working_dir.clone(),
+                self.sandbox,
+            )),
             Box::new(ReadFileTool::new(self.working_dir.clone())),
             Box::new(WriteFileTool::new(
                 self.auth.clone(),
@@ -76,6 +83,7 @@ impl ExpertAgent for CodingAgent {
     async fn init(&mut self, ctx: Arc<super::ExpertContext>) {
         self.auth = Some(ctx.auth.clone());
         self.working_dir = ctx.working_dir.clone();
+        self.sandbox = ctx.sandbox;
     }
 }
 
@@ -84,11 +92,21 @@ impl ExpertAgent for CodingAgent {
 #[derive(Debug, Clone)]
 pub struct ShellExecuteTool {
     auth: Option<Arc<autoagents_tool_auth::ToolAuthInterceptor>>,
+    working_dir: String,
+    sandbox: SandboxPolicy,
 }
 
 impl ShellExecuteTool {
-    pub fn new(auth: Option<Arc<autoagents_tool_auth::ToolAuthInterceptor>>) -> Self {
-        Self { auth }
+    pub fn new(
+        auth: Option<Arc<autoagents_tool_auth::ToolAuthInterceptor>>,
+        working_dir: String,
+        sandbox: SandboxPolicy,
+    ) -> Self {
+        Self {
+            auth,
+            working_dir,
+            sandbox,
+        }
     }
 }
 
@@ -118,27 +136,41 @@ impl ToolRuntime for ShellExecuteTool {
         let command = args["command"]
             .as_str()
             .ok_or(ToolCallError::RuntimeError("command required".into()))?;
-        let working_dir = args["working_dir"].as_str().unwrap_or("/tmp");
-        let timeout_secs = args["timeout_secs"].as_u64().unwrap_or(30);
 
-        if let Some(ref auth) = self.auth {
-            let (level, warning) = auth.analyze_shell_command(command);
-            if level == ShellDangerLevel::Unknown || level >= ShellDangerLevel::System {
-                return Err(ToolCallError::RuntimeError(
-                    format!(
-                        "Command blocked (level: {:?}): {}. User confirmation required.",
-                        level,
-                        warning.unwrap_or_default()
-                    )
-                    .into(),
-                ));
-            }
+        // Fail-closed danger gate: with no auth interceptor configured we
+        // refuse to run anything rather than running unchecked.
+        let auth = self
+            .auth
+            .as_ref()
+            .ok_or(ToolCallError::RuntimeError("auth not configured".into()))?;
+        let (level, warning) = auth.analyze_shell_command(command);
+        if level == ShellDangerLevel::Unknown || level >= ShellDangerLevel::System {
+            return Err(ToolCallError::RuntimeError(
+                format!(
+                    "Command blocked (level: {:?}): {}. User confirmation required.",
+                    level,
+                    warning.unwrap_or_default()
+                )
+                .into(),
+            ));
         }
 
-        let output = tokio::process::Command::new("sh")
-            .arg("-c")
-            .arg(command)
-            .current_dir(working_dir)
+        // Confine execution to the agent's working directory under the
+        // configured sandbox policy. The per-call `working_dir` arg is
+        // intentionally ignored so the LLM cannot relocate execution outside
+        // the sandboxed bind.
+        let workdir = if self.working_dir.is_empty() {
+            "/tmp".to_string()
+        } else {
+            self.working_dir.clone()
+        };
+        let home = std::env::var("HOME").ok();
+        let argv = resolve_argv(self.sandbox, &workdir, home.as_deref(), command)
+            .map_err(|e| ToolCallError::RuntimeError(e.into()))?;
+
+        let output = tokio::process::Command::new(&argv[0])
+            .args(&argv[1..])
+            .current_dir(&workdir)
             .output()
             .await
             .map_err(|e| ToolCallError::RuntimeError(e.to_string().into()))?;

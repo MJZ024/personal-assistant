@@ -74,7 +74,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     log::info!("LLM provider initialized");
 
     // Build ExpertContext shared by all expert agents.
-    let expert_ctx = runner::make_expert_context(auth.clone(), "/tmp/personal-assistant-workspace");
+    let expert_ctx = runner::make_expert_context(
+        auth.clone(),
+        "/tmp/personal-assistant-workspace",
+        autoagents_experts::sandbox::SandboxPolicy::Required,
+    );
 
     // Start heartbeat
     let heartbeat_db = database.clone();

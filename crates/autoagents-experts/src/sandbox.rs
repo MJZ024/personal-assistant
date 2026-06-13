@@ -88,6 +88,59 @@ fn is_within(parent: &str, child: &str) -> bool {
     child.starts_with(parent) && matches!(parent.components().next(), Some(Component::RootDir))
 }
 
+/// How strictly the coding agent's shell must be confined.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SandboxPolicy {
+    /// Refuse to run shell commands unless bwrap is available. Use on the
+    /// production server, where bubblewrap is installed and the threat model
+    /// includes prompt injection.
+    Required,
+    /// Use bwrap when available; otherwise fall back to an unsandboxed shell
+    /// (logged). Reasonable for a trusted local REPL on a dev machine.
+    Auto,
+    /// Never sandbox — shell commands run directly. Only for fully trusted
+    /// contexts where the caller accepts full responsibility.
+    Off,
+}
+
+/// Pure core of [`resolve_argv`]: decides the spawn argv given an explicit
+/// `available` flag so the policy logic is unit-testable without bwrap.
+fn decide(
+    policy: SandboxPolicy,
+    available: bool,
+    working_dir: &str,
+    home: Option<&str>,
+    command: &str,
+) -> Result<Vec<String>, &'static str> {
+    let inner: Vec<String> = vec!["sh".into(), "-c".into(), command.into()];
+    match policy {
+        SandboxPolicy::Off => Ok(inner),
+        SandboxPolicy::Auto if available => {
+            Ok(build_sandbox_argv(working_dir, home, &inner))
+        }
+        SandboxPolicy::Auto => Ok(inner),
+        SandboxPolicy::Required if available => {
+            Ok(build_sandbox_argv(working_dir, home, &inner))
+        }
+        SandboxPolicy::Required => Err("sandbox required but bwrap is not installed"),
+    }
+}
+
+/// Resolve the argv to run `command` under `policy`, probing the host for
+/// bwrap. On `Auto` without bwrap, logs a warning and runs unsandboxed.
+pub fn resolve_argv(
+    policy: SandboxPolicy,
+    working_dir: &str,
+    home: Option<&str>,
+    command: &str,
+) -> Result<Vec<String>, &'static str> {
+    let available = bwrap_available();
+    if matches!(policy, SandboxPolicy::Auto) && !available {
+        log::warn!("bwrap unavailable; running shell unsandboxed (policy=Auto)");
+    }
+    decide(policy, available, working_dir, home, command)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -217,5 +270,47 @@ mod tests {
         assert!(is_within("/opt/personal-assistant", "/opt/personal-assistant/sub"));
         assert!(!is_within("/opt/personal-assistant", "/opt/personal-assistant-evil"));
         assert!(!is_within("/home", "/opt"));
+    }
+
+    // ── decide(): policy × availability matrix (pure, no bwrap needed) ──
+
+    fn is_sandboxed(argv: &[String]) -> bool {
+        argv.first().map(String::as_str) == Some("bwrap")
+    }
+
+    #[test]
+    fn off_policy_never_sandboxes() {
+        for avail in [true, false] {
+            let argv = decide(SandboxPolicy::Off, avail, "/w", None, "ls").unwrap();
+            assert!(!is_sandboxed(&argv), "Off must not sandbox (avail={avail})");
+            assert_eq!(argv, ["sh", "-c", "ls"]);
+        }
+    }
+
+    #[test]
+    fn auto_sandboxes_when_available_falls_back_when_not() {
+        let with_bwrap = decide(SandboxPolicy::Auto, true, "/w", None, "ls").unwrap();
+        assert!(is_sandboxed(&with_bwrap));
+        let without = decide(SandboxPolicy::Auto, false, "/w", None, "ls").unwrap();
+        assert!(!is_sandboxed(&without), "Auto must fall back when bwrap absent");
+    }
+
+    #[test]
+    fn required_sandboxes_when_available_refuses_when_not() {
+        let with_bwrap = decide(SandboxPolicy::Required, true, "/w", None, "ls").unwrap();
+        assert!(is_sandboxed(&with_bwrap));
+        let refused = decide(SandboxPolicy::Required, false, "/w", None, "ls");
+        assert!(refused.is_err(), "Required without bwrap must refuse (fail-closed)");
+    }
+
+    #[test]
+    fn sandboxed_argv_carries_command_and_working_dir() {
+        let argv = decide(SandboxPolicy::Required, true, "/home/me/repo", None, "make test").unwrap();
+        // inner command is the tail after "--"
+        let sep = argv.iter().position(|a| a == "--").unwrap();
+        assert_eq!(&argv[sep + 1..], &["sh", "-c", "make test"]);
+        // working dir bound
+        let bind_idx = argv.iter().position(|a| a == "--bind").unwrap();
+        assert_eq!(argv[bind_idx + 1], "/home/me/repo");
     }
 }

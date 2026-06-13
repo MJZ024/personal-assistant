@@ -23,6 +23,8 @@ pub struct ExpertContext {
     pub auth: Arc<ToolAuthInterceptor>,
     /// Working directory for file operations.
     pub working_dir: String,
+    /// How strictly the coding agent's shell must be confined.
+    pub sandbox: sandbox::SandboxPolicy,
 }
 
 /// Trait for expert agents that can be dispatched by the supervisor.
