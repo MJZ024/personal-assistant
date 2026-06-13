@@ -1,9 +1,10 @@
-//! LLM provider factory — creates an [`Arc<dyn LLMProvider>`] from
+//! LLM provider factory — builds an [`Arc<dyn LLMProvider>`] from
 //! [`crate::config::ModelProvider`] entries, reading API keys from the
 //! environment variables named in the config.
 //!
-//! Supported backends: MiniMax, DeepSeek.
-//! GLM (Zhipu) will follow when the upstream `autoagents-llm` crate is updated.
+//! All backends that have built-in support in `autoagents-llm` are enabled
+//! (features in Cargo.toml).  GLM (Zhipu) is proxied through the OpenAI
+//! backend since its API is compatible.
 
 use std::sync::Arc;
 
@@ -12,10 +13,22 @@ use autoagents_llm::builder::LLMBuilder;
 
 use crate::config::ModelProvider;
 
-/// Build a single LLM provider from a [`ModelProvider`] config entry.
+/// Macro to avoid 12 boilerplate branches.
 ///
-/// Returns `Err` if the named env var is unset/empty, or the provider is
-/// unknown.
+/// Each branch is `let provider: Arc<ConcreteType> = …build()?; provider as Arc<dyn LLMProvider>`.
+macro_rules! build {
+    ($cfg:expr, $key:expr, $type:ty, $label:literal) => {{
+        let mut b = LLMBuilder::<$type>::new().api_key($key);
+        if let Some(ref u) = $cfg.base_url {
+            b = b.base_url(u);
+        }
+        b = b.model(&$cfg.model);
+        let provider: Arc<$type> = b.build().map_err(|e| format!("{}: {e}", $label))?;
+        Ok(provider as Arc<dyn LLMProvider>)
+    }};
+}
+
+/// Build a single LLM provider from a [`ModelProvider`] config entry.
 pub fn build_llm(cfg: &ModelProvider) -> Result<Arc<dyn LLMProvider>, String> {
     let api_key = std::env::var(&cfg.api_key_env).unwrap_or_default();
     if api_key.trim().is_empty() {
@@ -25,43 +38,97 @@ pub fn build_llm(cfg: &ModelProvider) -> Result<Arc<dyn LLMProvider>, String> {
         ));
     }
 
+    // Built-in backends — one per provider string.
     match cfg.provider.as_str() {
-        "minimax" => {
-            use autoagents_llm::backends::minimax::MiniMax;
-            let mut b = LLMBuilder::<MiniMax>::new().api_key(api_key);
-            if let Some(ref url) = cfg.base_url {
-                b = b.base_url(url);
-            }
-            b = b.model(&cfg.model);
-            let provider: Arc<MiniMax> = b.build().map_err(|e| format!("MiniMax: {e}"))?;
-            Ok(provider as Arc<dyn LLMProvider>)
-        }
-        "deepseek" => {
-            use autoagents_llm::backends::deepseek::DeepSeek;
-            let mut b = LLMBuilder::<DeepSeek>::new().api_key(api_key);
-            if let Some(ref url) = cfg.base_url {
-                b = b.base_url(url);
-            }
-            b = b.model(&cfg.model);
-            let provider: Arc<DeepSeek> = b.build().map_err(|e| format!("DeepSeek: {e}"))?;
-            Ok(provider as Arc<dyn LLMProvider>)
-        }
-        "glm" => Err(
-            "GLM (Zhipu) backend is not yet available in the server crate; \
-             it will be added when autoagents-llm publishes a GLM backend or \
-             we add one here. For now, use MiniMax or DeepSeek."
-                .to_string(),
+        // ── Chinese providers ──
+        "minimax" => build!(
+            cfg,
+            api_key,
+            autoagents_llm::backends::minimax::MiniMax,
+            "MiniMax"
         ),
-        other => Err(format!(
-            "unknown provider '{other}' — expected minimax, deepseek, or glm"
-        )),
+        "deepseek" => build!(
+            cfg,
+            api_key,
+            autoagents_llm::backends::deepseek::DeepSeek,
+            "DeepSeek"
+        ),
+        // Zhipu (glm) has an OpenAI-compatible API, so reuse the OpenAI backend.
+        "glm" => build_glm(cfg, api_key),
+        // ── Global leaders ──
+        "openai" => build!(
+            cfg,
+            api_key,
+            autoagents_llm::backends::openai::OpenAI,
+            "OpenAI"
+        ),
+        "anthropic" => build!(
+            cfg,
+            api_key,
+            autoagents_llm::backends::anthropic::Anthropic,
+            "Anthropic"
+        ),
+        // ── Speed / routing / local ──
+        "groq" => build!(cfg, api_key, autoagents_llm::backends::groq::Groq, "Groq"),
+        "openrouter" => build!(
+            cfg,
+            api_key,
+            autoagents_llm::backends::openrouter::OpenRouter,
+            "OpenRouter"
+        ),
+        "ollama" => build!(
+            cfg,
+            api_key,
+            autoagents_llm::backends::ollama::Ollama,
+            "Ollama"
+        ),
+        // ── Other cloud providers ──
+        "google" => build!(
+            cfg,
+            api_key,
+            autoagents_llm::backends::google::Google,
+            "Google (Gemini)"
+        ),
+        "xai" => build!(
+            cfg,
+            api_key,
+            autoagents_llm::backends::xai::XAI,
+            "xAI (Grok)"
+        ),
+        "phind" => build!(
+            cfg,
+            api_key,
+            autoagents_llm::backends::phind::Phind,
+            "Phind"
+        ),
+        "azure_openai" => build!(
+            cfg,
+            api_key,
+            autoagents_llm::backends::azure_openai::AzureOpenAI,
+            "Azure OpenAI"
+        ),
+        // ── Catch-all ──
+        other => Err(format!("unknown provider '{other}'")),
     }
 }
 
+/// GLM (Zhipu) via the OpenAI-compatible backend.
+fn build_glm(cfg: &ModelProvider, api_key: String) -> Result<Arc<dyn LLMProvider>, String> {
+    let url = cfg
+        .base_url
+        .clone()
+        .unwrap_or_else(|| "https://open.bigmodel.cn/api/paas/v4/".into());
+    let mut b = LLMBuilder::<autoagents_llm::backends::openai::OpenAI>::new()
+        .api_key(api_key)
+        .base_url(&url)
+        .model(&cfg.model);
+    // GLM does not require an org id.
+    let provider: Arc<autoagents_llm::backends::openai::OpenAI> =
+        b.build().map_err(|e| format!("GLM: {e}"))?;
+    Ok(provider as Arc<dyn LLMProvider>)
+}
+
 /// Build the primary LLM for the given agent from the model config.
-///
-/// Returns `Err` if the agent has no entry in the config or the primary
-/// provider's API key is not set.
 pub fn build_primary_llm(
     agent_name: &str,
     models: &crate::config::ModelConfig,
