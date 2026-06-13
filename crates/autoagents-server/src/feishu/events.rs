@@ -45,7 +45,10 @@ pub async fn event_callback(
         &cfg.verification_token,
         header_str(&headers, "x-lark-signature"),
         header_str(&headers, "x-lark-request-timestamp"),
-        header_str(&headers, "x-lark-request-nonce"),
+        header_any(
+            &headers,
+            &["x-lark-request-nonce", "x-lark-request-request-nonce"],
+        ),
         &body,
         now_secs,
     );
@@ -109,6 +112,22 @@ fn header_str<'a>(headers: &'a HeaderMap, name: &str) -> &'a str {
         .get(name)
         .and_then(|v| v.to_str().ok())
         .unwrap_or("")
+}
+
+/// Read the first present header from a list of candidate names.
+///
+/// Feishu's docs are inconsistent about the nonce header
+/// (`X-Lark-Request-Nonce` vs a doubled `X-Lark-Request-Request-Nonce`). Since
+/// the nonce is mixed into the signature, a wrong name silently breaks every
+/// signature-mode callback, so accept either spelling.
+fn header_any<'a>(headers: &'a HeaderMap, names: &[&str]) -> &'a str {
+    for name in names {
+        let value = header_str(headers, name);
+        if !value.is_empty() {
+            return value;
+        }
+    }
+    ""
 }
 
 /// Process an incoming message from a user.
@@ -364,6 +383,26 @@ mod router_tests {
         ];
         let (status, _) = send(app, request(&headers, body)).await;
         assert_eq!(status, StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn signature_mode_accepts_doubled_nonce_header_spelling() {
+        // Feishu's docs inconsistently show X-Lark-Request-Request-Nonce.
+        // The callback must accept either spelling or signature mode silently
+        // breaks for some app configurations.
+        let app = test_router("encrypt_key_abc", "");
+        let body = r#"{"challenge":"nonce-spelling"}"#;
+        let ts = chrono::Utc::now().timestamp().to_string();
+        let sig = compute_signature(&ts, "nonce-2", "encrypt_key_abc", body.as_bytes());
+        let headers = [
+            ("x-lark-signature", sig.as_str()),
+            ("x-lark-request-timestamp", ts.as_str()),
+            ("x-lark-request-request-nonce", "nonce-2"),
+        ];
+        let (status, resp_body) = send(app, request(&headers, body)).await;
+        assert_eq!(status, StatusCode::OK);
+        let v: serde_json::Value = serde_json::from_slice(&resp_body).unwrap();
+        assert_eq!(v["challenge"], "nonce-spelling");
     }
 
     #[tokio::test]
