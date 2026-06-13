@@ -7,6 +7,7 @@
 mod config;
 mod feishu;
 mod llm_provider;
+mod repl;
 mod runner;
 
 use std::sync::Arc;
@@ -24,6 +25,15 @@ use feishu::{FeishuClient, events::AppState};
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // CLI mode dispatch
+    let mode = std::env::args().nth(1).unwrap_or_default();
+
+    if mode == "repl" {
+        return run_repl().await;
+    }
+
+    // ── Server mode (default) ──
+
     // Initialize logging
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
 
@@ -115,6 +125,24 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     axum::serve(listener, app).await?;
 
+    Ok(())
+}
+
+/// Interactive REPL mode — no server, just stdin/stdout chat.
+async fn run_repl() -> Result<(), Box<dyn std::error::Error>> {
+    let config_path = std::env::var("ASSISTANT_CONFIG")
+        .unwrap_or_else(|_| "/opt/personal-assistant/config.yaml".to_string());
+
+    // REPL uses defaults when no config file exists — just print a note.
+    let app_config = if std::path::Path::new(&config_path).exists() {
+        AppConfig::from_file(&config_path)?
+    } else {
+        println!("(no config file at {config_path}, using defaults)");
+        println!();
+        AppConfig::default()
+    };
+    let auth = Arc::new(ToolAuthInterceptor::new(app_config.tool_auth.clone())?);
+    repl::run(app_config, auth).await;
     Ok(())
 }
 

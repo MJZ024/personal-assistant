@@ -72,6 +72,19 @@ pub fn spawn_expert(req: RunRequest, on_complete: impl FnOnce(RunOutcome) + Send
     });
 }
 
+/// Run an expert agent **synchronously** (block the caller until done).
+///
+/// Used by the REPL so the terminal waits for the result instead of
+/// receiving a pushed Feishu message.
+pub async fn run_expert_sync(
+    task_type: &str,
+    description: &str,
+    llm: Arc<dyn LLMProvider>,
+    context: Arc<ExpertContext>,
+) -> Result<String, RunnerError> {
+    run_expert(task_type, description, llm, context).await
+}
+
 // ── internal dispatch ──
 
 async fn run_expert(
@@ -118,7 +131,7 @@ async fn run_expert(
 }
 
 #[derive(Debug)]
-enum RunnerError {
+pub enum RunnerError {
     UnknownTaskType(String),
     Build(String),
     Run(String),
