@@ -64,7 +64,7 @@ impl AgentDeriveT for CodingAgent {
                 self.working_dir.clone(),
             )),
             Box::new(GitOperationTool::new(self.auth.clone())),
-            Box::new(CodeSearchTool),
+            Box::new(CodeSearchTool::new(self.working_dir.clone())),
         ]
     }
 }
@@ -349,6 +349,21 @@ impl ToolRuntime for GitOperationTool {
             .as_str()
             .ok_or(ToolCallError::RuntimeError("repo_path required".into()))?;
 
+        // `push` exfiltrates code and mutates the remote — gate it, and fail
+        // closed when no auth interceptor is configured.
+        if operation == "push" {
+            let auth = self
+                .auth
+                .as_ref()
+                .ok_or(ToolCallError::RuntimeError("auth not configured".into()))?;
+            let check = auth.check("coding", "git_push", PermissionLevel::System);
+            if check.needs_confirmation() {
+                return Err(ToolCallError::RuntimeError(
+                    "git push requires user confirmation.".into(),
+                ));
+            }
+        }
+
         let mut cmd = tokio::process::Command::new("git");
         cmd.arg(operation).current_dir(repo_path);
 
@@ -375,7 +390,15 @@ impl ToolRuntime for GitOperationTool {
 // ── Code Search Tool ──
 
 #[derive(Debug, Clone)]
-pub struct CodeSearchTool;
+pub struct CodeSearchTool {
+    working_dir: String,
+}
+
+impl CodeSearchTool {
+    pub fn new(working_dir: String) -> Self {
+        Self { working_dir }
+    }
+}
 
 impl ToolT for CodeSearchTool {
     fn name(&self) -> &str {
@@ -408,8 +431,16 @@ impl ToolRuntime for CodeSearchTool {
             .ok_or(ToolCallError::RuntimeError("directory required".into()))?;
         let file_pattern = args["file_pattern"].as_str();
 
+        // Confine the search root the same way read_file/write_file are, so
+        // the LLM cannot grep across secret-bearing directories.
+        let policy = super::path_policy::PathPolicy::for_coding(Some(&self.working_dir));
+        let safe_dir = policy.validate_resolved(directory).map_err(|e| {
+            ToolCallError::RuntimeError(format!("directory '{directory}' rejected: {e:?}").into())
+        })?;
+
         let mut cmd = tokio::process::Command::new("grep");
-        cmd.args(["-rn", "-E", pattern, directory]);
+        cmd.args(["-rn", "-E", pattern]);
+        cmd.arg(safe_dir.as_os_str());
         if let Some(fp) = file_pattern {
             cmd.args(["--include", fp]);
         }
@@ -427,5 +458,57 @@ impl ToolRuntime for CodeSearchTool {
             "total": stdout.lines().count(),
             "truncated": stdout.lines().count() > 100,
         }))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use autoagents_tool_auth::{ToolAuthConfig, ToolAuthInterceptor};
+    use std::sync::Arc;
+
+    fn test_auth() -> Arc<ToolAuthInterceptor> {
+        // AuditLogger opens its log path, so point it somewhere writable.
+        let mut cfg = ToolAuthConfig::default();
+        cfg.audit_log_path = "/tmp/pa-test-audit.log".into();
+        Arc::new(ToolAuthInterceptor::new(cfg).expect("interceptor"))
+    }
+
+    #[tokio::test]
+    async fn git_push_fails_closed_without_auth() {
+        let tool = GitOperationTool::new(None);
+        let res = tool
+            .execute(serde_json::json!({"operation":"push","repo_path":"/tmp"}))
+            .await;
+        assert!(res.is_err(), "git push must refuse when auth is None");
+    }
+
+    #[tokio::test]
+    async fn git_push_blocked_by_gate_with_auth() {
+        // coding agent cap is System; push is gated at System, which the
+        // (currently dead-letter) confirmation turns into a refusal.
+        let tool = GitOperationTool::new(Some(test_auth()));
+        let res = tool
+            .execute(serde_json::json!({"operation":"push","repo_path":"/tmp"}))
+            .await;
+        assert!(res.is_err(), "git push must pass through the auth gate");
+    }
+
+    #[tokio::test]
+    async fn code_search_rejects_secret_directory() {
+        let tool = CodeSearchTool::new("/home/me/repo".into());
+        let res = tool
+            .execute(serde_json::json!({"pattern":"KEY","directory":"/opt/personal-assistant"}))
+            .await;
+        assert!(res.is_err(), "code_search must refuse the secrets dir");
+    }
+
+    #[tokio::test]
+    async fn code_search_rejects_path_traversal() {
+        let tool = CodeSearchTool::new("/home/me/repo".into());
+        let res = tool
+            .execute(serde_json::json!({"pattern":"x","directory":"../../../etc"}))
+            .await;
+        assert!(res.is_err(), "code_search must reject traversal outside root");
     }
 }

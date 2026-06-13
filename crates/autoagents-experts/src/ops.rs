@@ -194,13 +194,17 @@ impl ToolRuntime for ServiceControlTool {
             .ok_or(ToolCallError::RuntimeError("service_name required".into()))?;
 
         if action != "status" {
-            if let Some(ref auth) = self.auth {
-                let check = auth.check("ops", "service_control", PermissionLevel::System);
-                if check.needs_confirmation() {
-                    return Err(ToolCallError::RuntimeError(
-                        "Service control requires user confirmation.".into(),
-                    ));
-                }
+            // Fail closed: without an auth interceptor, refuse rather than
+            // run a mutating service action unchecked.
+            let auth = self
+                .auth
+                .as_ref()
+                .ok_or(ToolCallError::RuntimeError("auth not configured".into()))?;
+            let check = auth.check("ops", "service_control", PermissionLevel::System);
+            if check.needs_confirmation() {
+                return Err(ToolCallError::RuntimeError(
+                    "Service control requires user confirmation.".into(),
+                ));
             }
         }
 
@@ -395,13 +399,17 @@ impl ToolRuntime for ProcessManageTool {
                 Ok(serde_json::json!({ "processes": procs }))
             }
             "kill" => {
-                if let Some(ref auth) = self.auth {
-                    let check = auth.check("ops", "process_manage", PermissionLevel::System);
-                    if check.needs_confirmation() {
-                        return Err(ToolCallError::RuntimeError(
-                            "Killing processes requires user confirmation.".into(),
-                        ));
-                    }
+                // Fail closed: without an auth interceptor, refuse rather
+                // than signal a process unchecked.
+                let auth = self
+                    .auth
+                    .as_ref()
+                    .ok_or(ToolCallError::RuntimeError("auth not configured".into()))?;
+                let check = auth.check("ops", "process_manage", PermissionLevel::System);
+                if check.needs_confirmation() {
+                    return Err(ToolCallError::RuntimeError(
+                        "Killing processes requires user confirmation.".into(),
+                    ));
                 }
                 let pid = args["pid"]
                     .as_u64()
@@ -420,5 +428,19 @@ impl ToolRuntime for ProcessManageTool {
             }
             _ => Err(ToolCallError::RuntimeError("Invalid action".into())),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn process_kill_fails_closed_without_auth() {
+        let tool = ProcessManageTool::new(None);
+        let res = tool
+            .execute(serde_json::json!({"action": "kill", "pid": 1}))
+            .await;
+        assert!(res.is_err(), "kill must refuse when auth is None");
     }
 }
