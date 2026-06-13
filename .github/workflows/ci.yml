@@ -59,37 +59,3 @@ jobs:
         # upstream. We run clippy as an advisory pass and rely on Format + Test
         # for the hard gates.
         run: cargo clippy -p autoagents-server -p autoagents-experts -p autoagents-tool-auth -p autoagents-supervisor
-
-  coverage:
-    name: Coverage
-    runs-on: ubuntu-latest
-    permissions:
-      contents: read
-      pull-requests: write
-    needs: [test, lint]   # only worth running if basics pass
-    steps:
-      - uses: actions/checkout@v4
-      - name: Setup Rust
-        uses: dtolnay/rust-toolchain@stable
-        with:
-          components: llvm-tools-preview
-      - name: Install tarpaulin
-        run: cargo install cargo-tarpaulin
-      - name: Coverage
-        run: |
-          cargo tarpaulin \
-            --engine llvm \
-            --timeout 220 \
-            --ignore-panics \
-            -p autoagents-server \
-            -p autoagents-experts \
-            -p autoagents-tool-auth \
-            -p autoagents-supervisor \
-            --out Xml
-      - name: Upload to Codecov
-        uses: codecov/codecov-action@v5
-        with:
-          token: ${{ secrets.CODECOV_TOKEN }}
-          verbose: true
-          fail_ci_if_error: false    # don't block PRs over coverage drops
-          files: ./cobertura.xml
