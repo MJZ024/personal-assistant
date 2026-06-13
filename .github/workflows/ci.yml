@@ -62,3 +62,20 @@ jobs:
         # upstream. We run clippy as an advisory pass and rely on Format + Test
         # for the hard gates.
         run: cargo clippy -p autoagents-server -p autoagents-experts -p autoagents-tool-auth -p autoagents-supervisor
+
+  release:
+    name: Release Binary (Linux x86_64)
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    needs: [test, lint]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+      - name: Build (release)
+        run: cargo build -p autoagents-server --release
+      - name: Upload binary
+        uses: actions/upload-artifact@v4
+        with:
+          name: personal-assistant-linux-x86_64
+          path: target/release/personal-assistant
