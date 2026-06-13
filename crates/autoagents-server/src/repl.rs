@@ -30,7 +30,7 @@ pub async fn run(app_config: AppConfig, auth: Arc<ToolAuthInterceptor>) {
         database,
     )));
 
-    let llm = match crate::llm_provider::build_primary_llm("coding", &app_config.models) {
+    let llm = match crate::llm_provider::build_any_llm("coding", &app_config.models) {
         Ok(llm) => llm,
         Err(e) => {
             eprintln!("Cannot start REPL: {e}");

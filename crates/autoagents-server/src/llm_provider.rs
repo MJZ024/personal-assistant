@@ -140,3 +140,26 @@ pub fn build_primary_llm(
         .ok_or_else(|| format!("no model config for agent '{agent_name}'"))?;
     build_llm(&entry.primary)
 }
+
+/// Try the primary provider for `agent_name`, then each fallback in order,
+/// returning the first whose API key is set. Falls back to primary's error
+/// if nothing works.
+pub fn build_any_llm(
+    agent_name: &str,
+    models: &crate::config::ModelConfig,
+) -> Result<Arc<dyn LLMProvider>, String> {
+    let entry = models
+        .agents
+        .iter()
+        .find(|a| a.name == agent_name)
+        .ok_or_else(|| format!("no model config for agent '{agent_name}'"))?;
+
+    let providers = std::iter::once(&entry.primary).chain(entry.fallbacks.iter());
+    for cfg in providers {
+        if let Ok(llm) = build_llm(cfg) {
+            return Ok(llm);
+        }
+    }
+    // Everything failed — return the primary's error for clarity.
+    build_llm(&entry.primary)
+}

@@ -128,7 +128,27 @@ async fn run_expert(
                 .map_err(|e| RunnerError::Run(format!("{e}")))?
                 .into())
         }
-        other => Err(RunnerError::UnknownTaskType(other.into())),
+        unknown => {
+            // Supervisor may classify a task for an agent that isn't
+            // implemented yet (document, information, knowledge).  Fall back
+            // to the most general-purpose agent so the user still gets a
+            // response instead of a dead end.
+            eprintln!("(unknown agent type '{unknown}', falling back to coding)");
+            let mut agent = CodingAgent::new();
+            agent.init(context).await;
+            let react = ReActAgent::new(agent);
+            let handle = AgentBuilder::<_, DirectAgent>::new(react)
+                .llm(llm)
+                .build()
+                .await
+                .map_err(|e| RunnerError::Build(format!("{e}")))?;
+            Ok(handle
+                .agent
+                .run(Task::new(description))
+                .await
+                .map_err(|e| RunnerError::Run(format!("{e}")))?
+                .into())
+        }
     }
 }
 

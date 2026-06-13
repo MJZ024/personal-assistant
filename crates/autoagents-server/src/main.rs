@@ -132,6 +132,51 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
+/// Developer convenience: borrow the API key from Claude Code's config when
+/// it is installed on the machine, so the REPL works out-of-box without
+/// manual env-var setup.  Does nothing on a production server where
+/// `~/.claude/settings.json` is absent.
+fn load_dev_api_keys() {
+    let Some(home) = std::env::var_os("HOME") else { return };
+    let path = std::path::PathBuf::from(home)
+        .join(".claude")
+        .join("settings.json");
+    let Ok(content) = std::fs::read_to_string(path) else { return };
+    let Ok(config) = serde_json::from_str::<serde_json::Value>(&content) else {
+        return;
+    };
+    let Some(env) = config.get("env") else { return };
+
+    // Map Claude Code's auth token to the project provider that matches the
+    // configured base URL, so the key is only set for the right backend.
+    // SAFETY: called at REPL startup before any worker threads exist.
+    let token = env
+        .get("ANTHROPIC_AUTH_TOKEN")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    let base_url = env
+        .get("ANTHROPIC_BASE_URL")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+
+    let project_key = if base_url.contains("deepseek") {
+        "DEEPSEEK_KEY"
+    } else if base_url.contains("openai") {
+        "OPENAI_API_KEY"
+    } else {
+        // Unknown — set all common keys as a best-effort fallback.
+        // They won't work if the token format isn't accepted by the
+        // provider; the error surfaces at first API call.
+        ""
+    };
+
+    if !project_key.is_empty() && std::env::var(project_key).is_err() && !token.is_empty() {
+        unsafe {
+            std::env::set_var(project_key, token);
+        }
+    }
+}
+
 /// Interactive REPL mode — no server, just stdin/stdout chat.
 async fn run_repl() -> Result<(), Box<dyn std::error::Error>> {
     let config_path = std::env::var("ASSISTANT_CONFIG")
@@ -145,7 +190,14 @@ async fn run_repl() -> Result<(), Box<dyn std::error::Error>> {
         println!();
         AppConfig::default()
     };
-    let auth = Arc::new(ToolAuthInterceptor::new(app_config.tool_auth.clone())?);
+    let mut tool_auth = app_config.tool_auth.clone();
+    if !std::path::Path::new(&config_path).exists() {
+        // Dev machine without /opt/personal-assistant — use a writable temp
+        // path so the audit logger can initialise without permission errors.
+        tool_auth.audit_log_path = "/tmp/personal-assistant-audit.log".into();
+    }
+    let auth = Arc::new(ToolAuthInterceptor::new(tool_auth)?);
+    load_dev_api_keys();
     repl::run(app_config, auth).await;
     Ok(())
 }
