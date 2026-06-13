@@ -7,6 +7,7 @@
 mod coding;
 mod ops;
 mod path_policy;
+pub mod redact;
 pub mod sandbox;
 mod tools;
 

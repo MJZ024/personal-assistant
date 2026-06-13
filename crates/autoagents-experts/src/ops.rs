@@ -8,6 +8,7 @@ use autoagents_core::tool::{ToolCallError, ToolRuntime, ToolT};
 
 use autoagents_tool_auth::PermissionLevel;
 
+use super::redact::redact_secrets;
 use super::ExpertAgent;
 
 // ── Agent Definition ──
@@ -284,7 +285,7 @@ impl ToolRuntime for LogViewTool {
         };
 
         let output = output.map_err(|e| ToolCallError::RuntimeError(e.to_string().into()))?;
-        let log_text = String::from_utf8_lossy(&output.stdout);
+        let log_text = redact_secrets(&String::from_utf8_lossy(&output.stdout));
         Ok(serde_json::json!({ "log": log_text, "line_count": log_text.lines().count() }))
     }
 }

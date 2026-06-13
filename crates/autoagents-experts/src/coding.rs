@@ -8,6 +8,7 @@ use autoagents_core::tool::{ToolCallError, ToolRuntime, ToolT};
 
 use autoagents_tool_auth::{PermissionLevel, ShellDangerLevel};
 
+use super::redact::redact_secrets;
 use super::sandbox::{resolve_argv, SandboxPolicy};
 use super::ExpertAgent;
 
@@ -176,8 +177,8 @@ impl ToolRuntime for ShellExecuteTool {
             .map_err(|e| ToolCallError::RuntimeError(e.to_string().into()))?;
 
         Ok(serde_json::json!({
-            "stdout": String::from_utf8_lossy(&output.stdout),
-            "stderr": String::from_utf8_lossy(&output.stderr),
+            "stdout": redact_secrets(&String::from_utf8_lossy(&output.stdout)),
+            "stderr": redact_secrets(&String::from_utf8_lossy(&output.stderr)),
             "exit_code": output.status.code(),
             "success": output.status.success(),
         }))
@@ -236,7 +237,7 @@ impl ToolRuntime for ReadFileTool {
             .map_err(|e| ToolCallError::RuntimeError(e.to_string().into()))?;
         let lines: Vec<&str> = contents.lines().take(max_lines).collect();
 
-        Ok(serde_json::json!({ "path": path, "lines": lines.len(), "content": lines.join("\n") }))
+        Ok(serde_json::json!({ "path": path, "lines": lines.len(), "content": redact_secrets(&lines.join("\n")) }))
     }
 }
 
@@ -450,7 +451,7 @@ impl ToolRuntime for CodeSearchTool {
             .await
             .map_err(|e| ToolCallError::RuntimeError(e.to_string().into()))?;
 
-        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stdout = redact_secrets(&String::from_utf8_lossy(&output.stdout));
         let matches: Vec<&str> = stdout.lines().take(100).collect();
 
         Ok(serde_json::json!({
