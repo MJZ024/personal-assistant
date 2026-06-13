@@ -4,8 +4,8 @@ use serde::{Deserialize, Serialize};
 use std::path::Path;
 
 use autoagents_memory::MemoryConfig;
-use autoagents_tool_auth::ToolAuthConfig;
 use autoagents_supervisor::SupervisorConfig;
+use autoagents_tool_auth::ToolAuthConfig;
 
 use crate::feishu::FeishuConfig;
 
@@ -47,11 +47,14 @@ impl AppConfig {
                 std::fs::create_dir_all(parent)?;
             }
             std::fs::write(path, yaml)?;
+            restrict_file_perms(path);
             return Ok(config);
         }
 
         let contents = std::fs::read_to_string(path)?;
         let config: Self = serde_yaml::from_str(&contents)?;
+        // Re-tighten permissions in case the file was hand-edited world-readable.
+        restrict_file_perms(path);
         Ok(config)
     }
 
@@ -147,4 +150,24 @@ pub struct ModelProvider {
     pub model: String,
     pub api_key_env: String,
     pub base_url: Option<String>,
+}
+
+/// Tighten a file's permissions to owner-only (0600) on Unix.
+///
+/// The config file holds `app_secret`, `encrypt_key`, and `verification_token`,
+/// so it must never be world- or group-readable. Errors are logged, not fatal:
+/// the server can still start, but the operator is alerted.
+fn restrict_file_perms(path: &str) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        match std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)) {
+            Ok(()) => {}
+            Err(e) => log::warn!("Could not tighten permissions on {}: {}", path, e),
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = path;
+    }
 }

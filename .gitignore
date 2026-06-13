@@ -255,3 +255,9 @@ __marimo__/
 .streamlit/secrets.toml
 
 .uv-cache
+
+# Personal Assistant — never commit live configuration or secrets
+deploy/config.yaml
+/opt/**/config.yaml
+*.local.yaml
+.llm/secrets.json

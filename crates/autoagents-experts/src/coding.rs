@@ -3,8 +3,8 @@
 use serde_json::Value;
 use std::sync::Arc;
 
-use autoagents_core::agent::{AgentDeriveT};
-use autoagents_core::tool::{ToolRuntime, ToolT, ToolCallError};
+use autoagents_core::agent::AgentDeriveT;
+use autoagents_core::tool::{ToolCallError, ToolRuntime, ToolT};
 
 use autoagents_tool_auth::{PermissionLevel, ShellDangerLevel};
 
@@ -26,7 +26,9 @@ impl CodingAgent {
         }
     }
 
-    pub fn name() -> &'static str { "coding" }
+    pub fn name() -> &'static str {
+        "coding"
+    }
     pub fn description() -> &'static str {
         "Expert coding agent — writes, tests, debugs code. Has shell, file, git, and code search tools."
     }
@@ -36,15 +38,24 @@ impl CodingAgent {
 impl AgentDeriveT for CodingAgent {
     type Output = String;
 
-    fn description(&self) -> &str { Self::description() }
-    fn output_schema(&self) -> Option<Value> { None }
-    fn name(&self) -> &str { Self::name() }
+    fn description(&self) -> &str {
+        Self::description()
+    }
+    fn output_schema(&self) -> Option<Value> {
+        None
+    }
+    fn name(&self) -> &str {
+        Self::name()
+    }
 
     fn tools(&self) -> Vec<Box<dyn ToolT>> {
         vec![
             Box::new(ShellExecuteTool::new(self.auth.clone())),
-            Box::new(ReadFileTool),
-            Box::new(WriteFileTool::new(self.auth.clone())),
+            Box::new(ReadFileTool::new(self.working_dir.clone())),
+            Box::new(WriteFileTool::new(
+                self.auth.clone(),
+                self.working_dir.clone(),
+            )),
             Box::new(GitOperationTool::new(self.auth.clone())),
             Box::new(CodeSearchTool),
         ]
@@ -53,8 +64,12 @@ impl AgentDeriveT for CodingAgent {
 
 #[async_trait::async_trait]
 impl ExpertAgent for CodingAgent {
-    fn agent_type(&self) -> &'static str { "coding" }
-    fn max_permission_level(&self) -> PermissionLevel { PermissionLevel::System }
+    fn agent_type(&self) -> &'static str {
+        "coding"
+    }
+    fn max_permission_level(&self) -> PermissionLevel {
+        PermissionLevel::System
+    }
     async fn init(&mut self, ctx: Arc<super::ExpertContext>) {
         self.auth = Some(ctx.auth.clone());
         self.working_dir = ctx.working_dir.clone();
@@ -69,12 +84,18 @@ pub struct ShellExecuteTool {
 }
 
 impl ShellExecuteTool {
-    pub fn new(auth: Option<Arc<autoagents_tool_auth::ToolAuthInterceptor>>) -> Self { Self { auth } }
+    pub fn new(auth: Option<Arc<autoagents_tool_auth::ToolAuthInterceptor>>) -> Self {
+        Self { auth }
+    }
 }
 
 impl ToolT for ShellExecuteTool {
-    fn name(&self) -> &str { "shell_execute" }
-    fn description(&self) -> &str { "Execute a shell command. Destructive commands require user confirmation." }
+    fn name(&self) -> &str {
+        "shell_execute"
+    }
+    fn description(&self) -> &str {
+        "Execute a shell command. Destructive commands require user confirmation."
+    }
     fn args_schema(&self) -> Value {
         serde_json::json!({
             "type": "object",
@@ -91,24 +112,32 @@ impl ToolT for ShellExecuteTool {
 #[async_trait::async_trait]
 impl ToolRuntime for ShellExecuteTool {
     async fn execute(&self, args: Value) -> Result<Value, ToolCallError> {
-        let command = args["command"].as_str().ok_or(ToolCallError::RuntimeError("command required".into()))?;
+        let command = args["command"]
+            .as_str()
+            .ok_or(ToolCallError::RuntimeError("command required".into()))?;
         let working_dir = args["working_dir"].as_str().unwrap_or("/tmp");
         let timeout_secs = args["timeout_secs"].as_u64().unwrap_or(30);
 
         if let Some(ref auth) = self.auth {
             let (level, warning) = auth.analyze_shell_command(command);
             if level == ShellDangerLevel::Unknown || level >= ShellDangerLevel::System {
-                return Err(ToolCallError::RuntimeError(format!(
-                    "Command blocked (level: {:?}): {}. User confirmation required.",
-                    level, warning.unwrap_or_default()
-                ).into()));
+                return Err(ToolCallError::RuntimeError(
+                    format!(
+                        "Command blocked (level: {:?}): {}. User confirmation required.",
+                        level,
+                        warning.unwrap_or_default()
+                    )
+                    .into(),
+                ));
             }
         }
 
         let output = tokio::process::Command::new("sh")
-            .arg("-c").arg(command)
+            .arg("-c")
+            .arg(command)
             .current_dir(working_dir)
-            .output().await
+            .output()
+            .await
             .map_err(|e| ToolCallError::RuntimeError(e.to_string().into()))?;
 
         Ok(serde_json::json!({
@@ -123,11 +152,23 @@ impl ToolRuntime for ShellExecuteTool {
 // ── Read File Tool ──
 
 #[derive(Debug, Clone)]
-pub struct ReadFileTool;
+pub struct ReadFileTool {
+    working_dir: String,
+}
+
+impl ReadFileTool {
+    pub fn new(working_dir: String) -> Self {
+        Self { working_dir }
+    }
+}
 
 impl ToolT for ReadFileTool {
-    fn name(&self) -> &str { "read_file" }
-    fn description(&self) -> &str { "Read the contents of a file." }
+    fn name(&self) -> &str {
+        "read_file"
+    }
+    fn description(&self) -> &str {
+        "Read the contents of a file."
+    }
     fn args_schema(&self) -> Value {
         serde_json::json!({
             "type": "object",
@@ -143,10 +184,20 @@ impl ToolT for ReadFileTool {
 #[async_trait::async_trait]
 impl ToolRuntime for ReadFileTool {
     async fn execute(&self, args: Value) -> Result<Value, ToolCallError> {
-        let path = args["path"].as_str().ok_or(ToolCallError::RuntimeError("path required".into()))?;
+        let path = args["path"]
+            .as_str()
+            .ok_or(ToolCallError::RuntimeError("path required".into()))?;
         let max_lines = args["max_lines"].as_u64().unwrap_or(5000) as usize;
 
-        let contents = tokio::fs::read_to_string(path).await
+        // Confine reads to the allow-root and deny sensitive locations.
+        // Symlink-resolved so a planted symlink can't exfiltrate a secret.
+        let policy = super::path_policy::PathPolicy::for_coding(Some(&self.working_dir));
+        let safe_path = policy.validate_resolved(path).map_err(|e| {
+            ToolCallError::RuntimeError(format!("path '{path}' rejected: {e:?}").into())
+        })?;
+
+        let contents = tokio::fs::read_to_string(&safe_path)
+            .await
             .map_err(|e| ToolCallError::RuntimeError(e.to_string().into()))?;
         let lines: Vec<&str> = contents.lines().take(max_lines).collect();
 
@@ -159,15 +210,25 @@ impl ToolRuntime for ReadFileTool {
 #[derive(Debug, Clone)]
 pub struct WriteFileTool {
     auth: Option<Arc<autoagents_tool_auth::ToolAuthInterceptor>>,
+    working_dir: String,
 }
 
 impl WriteFileTool {
-    pub fn new(auth: Option<Arc<autoagents_tool_auth::ToolAuthInterceptor>>) -> Self { Self { auth } }
+    pub fn new(
+        auth: Option<Arc<autoagents_tool_auth::ToolAuthInterceptor>>,
+        working_dir: String,
+    ) -> Self {
+        Self { auth, working_dir }
+    }
 }
 
 impl ToolT for WriteFileTool {
-    fn name(&self) -> &str { "write_file" }
-    fn description(&self) -> &str { "Write content to a file. Creates parent directories if needed." }
+    fn name(&self) -> &str {
+        "write_file"
+    }
+    fn description(&self) -> &str {
+        "Write content to a file. Creates parent directories if needed."
+    }
     fn args_schema(&self) -> Value {
         serde_json::json!({
             "type": "object",
@@ -183,15 +244,27 @@ impl ToolT for WriteFileTool {
 #[async_trait::async_trait]
 impl ToolRuntime for WriteFileTool {
     async fn execute(&self, args: Value) -> Result<Value, ToolCallError> {
-        let path = args["path"].as_str().ok_or(ToolCallError::RuntimeError("path required".into()))?;
-        let content = args["content"].as_str().ok_or(ToolCallError::RuntimeError("content required".into()))?;
+        let path = args["path"]
+            .as_str()
+            .ok_or(ToolCallError::RuntimeError("path required".into()))?;
+        let content = args["content"]
+            .as_str()
+            .ok_or(ToolCallError::RuntimeError("content required".into()))?;
 
-        if let Some(parent) = std::path::Path::new(path).parent() {
-            tokio::fs::create_dir_all(parent).await
+        // Confine writes to the allow-root and deny sensitive locations.
+        let policy = super::path_policy::PathPolicy::for_coding(Some(&self.working_dir));
+        let safe_path = policy.validate(path).map_err(|e| {
+            ToolCallError::RuntimeError(format!("path '{path}' rejected: {e:?}").into())
+        })?;
+
+        if let Some(parent) = safe_path.parent() {
+            tokio::fs::create_dir_all(parent)
+                .await
                 .map_err(|e| ToolCallError::RuntimeError(e.to_string().into()))?;
         }
 
-        tokio::fs::write(path, content).await
+        tokio::fs::write(&safe_path, content)
+            .await
             .map_err(|e| ToolCallError::RuntimeError(e.to_string().into()))?;
 
         Ok(serde_json::json!({ "path": path, "written": true }))
@@ -206,12 +279,18 @@ pub struct GitOperationTool {
 }
 
 impl GitOperationTool {
-    pub fn new(auth: Option<Arc<autoagents_tool_auth::ToolAuthInterceptor>>) -> Self { Self { auth } }
+    pub fn new(auth: Option<Arc<autoagents_tool_auth::ToolAuthInterceptor>>) -> Self {
+        Self { auth }
+    }
 }
 
 impl ToolT for GitOperationTool {
-    fn name(&self) -> &str { "git_operation" }
-    fn description(&self) -> &str { "Execute git: status, add, commit, push, log, diff, branch." }
+    fn name(&self) -> &str {
+        "git_operation"
+    }
+    fn description(&self) -> &str {
+        "Execute git: status, add, commit, push, log, diff, branch."
+    }
     fn args_schema(&self) -> Value {
         serde_json::json!({
             "type": "object",
@@ -228,8 +307,12 @@ impl ToolT for GitOperationTool {
 #[async_trait::async_trait]
 impl ToolRuntime for GitOperationTool {
     async fn execute(&self, args: Value) -> Result<Value, ToolCallError> {
-        let operation = args["operation"].as_str().ok_or(ToolCallError::RuntimeError("operation required".into()))?;
-        let repo_path = args["repo_path"].as_str().ok_or(ToolCallError::RuntimeError("repo_path required".into()))?;
+        let operation = args["operation"]
+            .as_str()
+            .ok_or(ToolCallError::RuntimeError("operation required".into()))?;
+        let repo_path = args["repo_path"]
+            .as_str()
+            .ok_or(ToolCallError::RuntimeError("repo_path required".into()))?;
 
         let mut cmd = tokio::process::Command::new("git");
         cmd.arg(operation).current_dir(repo_path);
@@ -240,7 +323,9 @@ impl ToolRuntime for GitOperationTool {
             }
         }
 
-        let output = cmd.output().await
+        let output = cmd
+            .output()
+            .await
             .map_err(|e| ToolCallError::RuntimeError(e.to_string().into()))?;
 
         Ok(serde_json::json!({
@@ -258,8 +343,12 @@ impl ToolRuntime for GitOperationTool {
 pub struct CodeSearchTool;
 
 impl ToolT for CodeSearchTool {
-    fn name(&self) -> &str { "code_search" }
-    fn description(&self) -> &str { "Search code using grep with regex patterns." }
+    fn name(&self) -> &str {
+        "code_search"
+    }
+    fn description(&self) -> &str {
+        "Search code using grep with regex patterns."
+    }
     fn args_schema(&self) -> Value {
         serde_json::json!({
             "type": "object",
@@ -276,15 +365,23 @@ impl ToolT for CodeSearchTool {
 #[async_trait::async_trait]
 impl ToolRuntime for CodeSearchTool {
     async fn execute(&self, args: Value) -> Result<Value, ToolCallError> {
-        let pattern = args["pattern"].as_str().ok_or(ToolCallError::RuntimeError("pattern required".into()))?;
-        let directory = args["directory"].as_str().ok_or(ToolCallError::RuntimeError("directory required".into()))?;
+        let pattern = args["pattern"]
+            .as_str()
+            .ok_or(ToolCallError::RuntimeError("pattern required".into()))?;
+        let directory = args["directory"]
+            .as_str()
+            .ok_or(ToolCallError::RuntimeError("directory required".into()))?;
         let file_pattern = args["file_pattern"].as_str();
 
         let mut cmd = tokio::process::Command::new("grep");
         cmd.args(["-rn", "-E", pattern, directory]);
-        if let Some(fp) = file_pattern { cmd.args(["--include", fp]); }
+        if let Some(fp) = file_pattern {
+            cmd.args(["--include", fp]);
+        }
 
-        let output = cmd.output().await
+        let output = cmd
+            .output()
+            .await
             .map_err(|e| ToolCallError::RuntimeError(e.to_string().into()))?;
 
         let stdout = String::from_utf8_lossy(&output.stdout);

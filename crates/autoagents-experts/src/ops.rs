@@ -4,7 +4,7 @@ use serde_json::Value;
 use std::sync::Arc;
 
 use autoagents_core::agent::AgentDeriveT;
-use autoagents_core::tool::{ToolRuntime, ToolT, ToolCallError};
+use autoagents_core::tool::{ToolCallError, ToolRuntime, ToolT};
 
 use autoagents_tool_auth::PermissionLevel;
 
@@ -18,8 +18,12 @@ pub struct OpsAgent {
 }
 
 impl OpsAgent {
-    pub fn new() -> Self { Self { auth: None } }
-    pub fn name() -> &'static str { "ops" }
+    pub fn new() -> Self {
+        Self { auth: None }
+    }
+    pub fn name() -> &'static str {
+        "ops"
+    }
     pub fn description() -> &'static str {
         "Expert ops agent — server monitoring, service control, log analysis, cron tasks, process management."
     }
@@ -29,9 +33,15 @@ impl OpsAgent {
 impl AgentDeriveT for OpsAgent {
     type Output = String;
 
-    fn description(&self) -> &str { Self::description() }
-    fn output_schema(&self) -> Option<Value> { None }
-    fn name(&self) -> &str { Self::name() }
+    fn description(&self) -> &str {
+        Self::description()
+    }
+    fn output_schema(&self) -> Option<Value> {
+        None
+    }
+    fn name(&self) -> &str {
+        Self::name()
+    }
 
     fn tools(&self) -> Vec<Box<dyn ToolT>> {
         vec![
@@ -46,8 +56,12 @@ impl AgentDeriveT for OpsAgent {
 
 #[async_trait::async_trait]
 impl ExpertAgent for OpsAgent {
-    fn agent_type(&self) -> &'static str { "ops" }
-    fn max_permission_level(&self) -> PermissionLevel { PermissionLevel::Destructive }
+    fn agent_type(&self) -> &'static str {
+        "ops"
+    }
+    fn max_permission_level(&self) -> PermissionLevel {
+        PermissionLevel::Destructive
+    }
     async fn init(&mut self, ctx: Arc<super::ExpertContext>) {
         self.auth = Some(ctx.auth.clone());
     }
@@ -59,8 +73,12 @@ impl ExpertAgent for OpsAgent {
 pub struct SystemStatusTool;
 
 impl ToolT for SystemStatusTool {
-    fn name(&self) -> &str { "system_status" }
-    fn description(&self) -> &str { "Query CPU, memory, disk, load average, and optionally top processes." }
+    fn name(&self) -> &str {
+        "system_status"
+    }
+    fn description(&self) -> &str {
+        "Query CPU, memory, disk, load average, and optionally top processes."
+    }
     fn args_schema(&self) -> Value {
         serde_json::json!({
             "type": "object",
@@ -74,20 +92,31 @@ impl ToolT for SystemStatusTool {
 #[async_trait::async_trait]
 impl ToolRuntime for SystemStatusTool {
     async fn execute(&self, args: Value) -> Result<Value, ToolCallError> {
-        let include_procs = args.get("include_processes").and_then(|v| v.as_bool()).unwrap_or(false);
+        let include_procs = args
+            .get("include_processes")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
         let mut result = serde_json::json!({});
 
         // CPU / Memory summary
-        if let Ok(output) = tokio::process::Command::new("top").args(["-bn1"]).output().await {
+        if let Ok(output) = tokio::process::Command::new("top")
+            .args(["-bn1"])
+            .output()
+            .await
+        {
             let stdout = String::from_utf8_lossy(&output.stdout);
-            result["top_summary"] = serde_json::Value::String(
-                stdout.lines().take(5).collect::<Vec<_>>().join("\n")
-            );
+            result["top_summary"] =
+                serde_json::Value::String(stdout.lines().take(5).collect::<Vec<_>>().join("\n"));
         }
 
         // Disk
-        if let Ok(output) = tokio::process::Command::new("df").args(["-h", "/"]).output().await {
-            result["disk_root"] = serde_json::Value::String(String::from_utf8_lossy(&output.stdout).to_string());
+        if let Ok(output) = tokio::process::Command::new("df")
+            .args(["-h", "/"])
+            .output()
+            .await
+        {
+            result["disk_root"] =
+                serde_json::Value::String(String::from_utf8_lossy(&output.stdout).to_string());
         }
 
         // Load average
@@ -97,19 +126,20 @@ impl ToolRuntime for SystemStatusTool {
 
         // Memory
         if let Ok(meminfo) = tokio::fs::read_to_string("/proc/meminfo").await {
-            result["memory"] = serde_json::Value::String(
-                meminfo.lines().take(3).collect::<Vec<_>>().join("\n")
-            );
+            result["memory"] =
+                serde_json::Value::String(meminfo.lines().take(3).collect::<Vec<_>>().join("\n"));
         }
 
         // Processes
         if include_procs {
             if let Ok(output) = tokio::process::Command::new("ps")
-                .args(["--no-headers", "-eo", "pid,comm,%cpu,%mem", "--sort=-%cpu"]).output().await
+                .args(["--no-headers", "-eo", "pid,comm,%cpu,%mem", "--sort=-%cpu"])
+                .output()
+                .await
             {
                 let stdout = String::from_utf8_lossy(&output.stdout);
                 result["top_processes"] = serde_json::Value::String(
-                    stdout.lines().take(10).collect::<Vec<_>>().join("\n")
+                    stdout.lines().take(10).collect::<Vec<_>>().join("\n"),
                 );
             }
         }
@@ -126,12 +156,18 @@ pub struct ServiceControlTool {
 }
 
 impl ServiceControlTool {
-    pub fn new(auth: Option<Arc<autoagents_tool_auth::ToolAuthInterceptor>>) -> Self { Self { auth } }
+    pub fn new(auth: Option<Arc<autoagents_tool_auth::ToolAuthInterceptor>>) -> Self {
+        Self { auth }
+    }
 }
 
 impl ToolT for ServiceControlTool {
-    fn name(&self) -> &str { "service_control" }
-    fn description(&self) -> &str { "Control systemd services: status, start, stop, restart, enable, disable." }
+    fn name(&self) -> &str {
+        "service_control"
+    }
+    fn description(&self) -> &str {
+        "Control systemd services: status, start, stop, restart, enable, disable."
+    }
     fn args_schema(&self) -> Value {
         serde_json::json!({
             "type": "object",
@@ -147,20 +183,29 @@ impl ToolT for ServiceControlTool {
 #[async_trait::async_trait]
 impl ToolRuntime for ServiceControlTool {
     async fn execute(&self, args: Value) -> Result<Value, ToolCallError> {
-        let action = args["action"].as_str().ok_or(ToolCallError::RuntimeError("action required".into()))?;
-        let service = args["service_name"].as_str().ok_or(ToolCallError::RuntimeError("service_name required".into()))?;
+        let action = args["action"]
+            .as_str()
+            .ok_or(ToolCallError::RuntimeError("action required".into()))?;
+        let service = args["service_name"]
+            .as_str()
+            .ok_or(ToolCallError::RuntimeError("service_name required".into()))?;
 
         if action != "status" {
             if let Some(ref auth) = self.auth {
                 let check = auth.check("ops", "service_control", PermissionLevel::System);
                 if check.needs_confirmation() {
-                    return Err(ToolCallError::RuntimeError("Service control requires user confirmation.".into()));
+                    return Err(ToolCallError::RuntimeError(
+                        "Service control requires user confirmation.".into(),
+                    ));
                 }
             }
         }
 
         let output = tokio::process::Command::new("systemctl")
-            .arg(action).arg(service).output().await
+            .arg(action)
+            .arg(service)
+            .output()
+            .await
             .map_err(|e| ToolCallError::RuntimeError(e.to_string().into()))?;
 
         Ok(serde_json::json!({
@@ -177,8 +222,12 @@ impl ToolRuntime for ServiceControlTool {
 pub struct LogViewTool;
 
 impl ToolT for LogViewTool {
-    fn name(&self) -> &str { "log_view" }
-    fn description(&self) -> &str { "View system or application logs via journalctl or tail." }
+    fn name(&self) -> &str {
+        "log_view"
+    }
+    fn description(&self) -> &str {
+        "View system or application logs via journalctl or tail."
+    }
     fn args_schema(&self) -> Value {
         serde_json::json!({
             "type": "object",
@@ -195,17 +244,36 @@ impl ToolT for LogViewTool {
 #[async_trait::async_trait]
 impl ToolRuntime for LogViewTool {
     async fn execute(&self, args: Value) -> Result<Value, ToolCallError> {
-        let source = args["source"].as_str().ok_or(ToolCallError::RuntimeError("source required".into()))?;
+        let source = args["source"]
+            .as_str()
+            .ok_or(ToolCallError::RuntimeError("source required".into()))?;
         let lines = args["lines"].as_u64().unwrap_or(50).to_string();
 
         let output = if source == "journalctl" {
             let service = args["service"].as_str().unwrap_or("");
             let mut cmd = tokio::process::Command::new("journalctl");
             cmd.args(["-n", &lines, "--no-pager"]);
-            if !service.is_empty() { cmd.args(["-u", service]); }
+            if !service.is_empty() {
+                cmd.args(["-u", service]);
+            }
             cmd.output().await
         } else {
-            tokio::process::Command::new("tail").args(["-n", &lines, source]).output().await
+            // Confine log reads: block secret-bearing paths (config.yaml,
+            // ~/.ssh, /etc/shadow, …) even though /var/log stays open.
+            let policy = super::path_policy::PathPolicy::for_logs();
+            let safe = match policy.validate_resolved(source) {
+                Ok(p) => p,
+                Err(e) => {
+                    return Err(ToolCallError::RuntimeError(
+                        format!("log source '{source}' rejected: {e:?}").into(),
+                    ));
+                }
+            };
+            tokio::process::Command::new("tail")
+                .args(["-n", &lines])
+                .arg(safe.as_os_str())
+                .output()
+                .await
         };
 
         let output = output.map_err(|e| ToolCallError::RuntimeError(e.to_string().into()))?;
@@ -222,12 +290,18 @@ pub struct CronTaskTool {
 }
 
 impl CronTaskTool {
-    pub fn new(auth: Option<Arc<autoagents_tool_auth::ToolAuthInterceptor>>) -> Self { Self { auth } }
+    pub fn new(auth: Option<Arc<autoagents_tool_auth::ToolAuthInterceptor>>) -> Self {
+        Self { auth }
+    }
 }
 
 impl ToolT for CronTaskTool {
-    fn name(&self) -> &str { "cron_task" }
-    fn description(&self) -> &str { "View (list) cron scheduled tasks." }
+    fn name(&self) -> &str {
+        "cron_task"
+    }
+    fn description(&self) -> &str {
+        "View (list) cron scheduled tasks."
+    }
     fn args_schema(&self) -> Value {
         serde_json::json!({
             "type": "object",
@@ -242,14 +316,21 @@ impl ToolT for CronTaskTool {
 #[async_trait::async_trait]
 impl ToolRuntime for CronTaskTool {
     async fn execute(&self, args: Value) -> Result<Value, ToolCallError> {
-        let action = args["action"].as_str().ok_or(ToolCallError::RuntimeError("action required".into()))?;
+        let action = args["action"]
+            .as_str()
+            .ok_or(ToolCallError::RuntimeError("action required".into()))?;
         match action {
             "list" => {
-                let output = tokio::process::Command::new("crontab").arg("-l").output().await
+                let output = tokio::process::Command::new("crontab")
+                    .arg("-l")
+                    .output()
+                    .await
                     .map_err(|e| ToolCallError::RuntimeError(e.to_string().into()))?;
                 Ok(serde_json::json!({ "crontab": String::from_utf8_lossy(&output.stdout) }))
             }
-            _ => Err(ToolCallError::RuntimeError("Only 'list' is supported via tool.".into())),
+            _ => Err(ToolCallError::RuntimeError(
+                "Only 'list' is supported via tool.".into(),
+            )),
         }
     }
 }
@@ -262,12 +343,18 @@ pub struct ProcessManageTool {
 }
 
 impl ProcessManageTool {
-    pub fn new(auth: Option<Arc<autoagents_tool_auth::ToolAuthInterceptor>>) -> Self { Self { auth } }
+    pub fn new(auth: Option<Arc<autoagents_tool_auth::ToolAuthInterceptor>>) -> Self {
+        Self { auth }
+    }
 }
 
 impl ToolT for ProcessManageTool {
-    fn name(&self) -> &str { "process_manage" }
-    fn description(&self) -> &str { "List processes or kill by PID." }
+    fn name(&self) -> &str {
+        "process_manage"
+    }
+    fn description(&self) -> &str {
+        "List processes or kill by PID."
+    }
     fn args_schema(&self) -> Value {
         serde_json::json!({
             "type": "object",
@@ -284,12 +371,21 @@ impl ToolT for ProcessManageTool {
 #[async_trait::async_trait]
 impl ToolRuntime for ProcessManageTool {
     async fn execute(&self, args: Value) -> Result<Value, ToolCallError> {
-        let action = args["action"].as_str().ok_or(ToolCallError::RuntimeError("action required".into()))?;
+        let action = args["action"]
+            .as_str()
+            .ok_or(ToolCallError::RuntimeError("action required".into()))?;
         match action {
             "list" => {
                 let output = tokio::process::Command::new("ps")
-                    .args(["--no-headers", "-eo", "pid,user,%cpu,%mem,comm", "--sort=-%cpu"])
-                    .output().await.map_err(|e| ToolCallError::RuntimeError(e.to_string().into()))?;
+                    .args([
+                        "--no-headers",
+                        "-eo",
+                        "pid,user,%cpu,%mem,comm",
+                        "--sort=-%cpu",
+                    ])
+                    .output()
+                    .await
+                    .map_err(|e| ToolCallError::RuntimeError(e.to_string().into()))?;
 
                 let stdout = String::from_utf8_lossy(&output.stdout);
                 let procs: Vec<&str> = stdout.lines().take(20).collect();
@@ -299,17 +395,25 @@ impl ToolRuntime for ProcessManageTool {
                 if let Some(ref auth) = self.auth {
                     let check = auth.check("ops", "process_manage", PermissionLevel::System);
                     if check.needs_confirmation() {
-                        return Err(ToolCallError::RuntimeError("Killing processes requires user confirmation.".into()));
+                        return Err(ToolCallError::RuntimeError(
+                            "Killing processes requires user confirmation.".into(),
+                        ));
                     }
                 }
-                let pid = args["pid"].as_u64().ok_or(ToolCallError::RuntimeError("pid required".into()))?;
+                let pid = args["pid"]
+                    .as_u64()
+                    .ok_or(ToolCallError::RuntimeError("pid required".into()))?;
                 let signal = args["signal"].as_str().unwrap_or("SIGTERM");
 
                 let output = tokio::process::Command::new("kill")
-                    .args(["-s", signal, &pid.to_string()]).output().await
+                    .args(["-s", signal, &pid.to_string()])
+                    .output()
+                    .await
                     .map_err(|e| ToolCallError::RuntimeError(e.to_string().into()))?;
 
-                Ok(serde_json::json!({ "pid": pid, "signal": signal, "success": output.status.success() }))
+                Ok(
+                    serde_json::json!({ "pid": pid, "signal": signal, "success": output.status.success() }),
+                )
             }
             _ => Err(ToolCallError::RuntimeError("Invalid action".into())),
         }

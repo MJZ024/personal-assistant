@@ -6,6 +6,7 @@
 
 mod coding;
 mod ops;
+mod path_policy;
 mod tools;
 
 pub use coding::CodingAgent;

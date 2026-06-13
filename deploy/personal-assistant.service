@@ -5,6 +5,10 @@ Wants=network-online.target
 
 [Service]
 Type=simple
+# Run as a dedicated unprivileged account — never root. The account and its
+# data dir are created by deploy/build_and_deploy.sh.
+User=personal-assistant
+Group=personal-assistant
 ExecStart=/usr/local/bin/personal-assistant
 Restart=always
 RestartSec=5

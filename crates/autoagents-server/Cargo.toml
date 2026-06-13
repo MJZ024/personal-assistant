@@ -35,3 +35,13 @@ uuid = { workspace = true }
 reqwest = { workspace = true, features = ["json", "multipart"] }
 tokio = { workspace = true }
 bytes = { workspace = true }
+# Security: Feishu event signature verification + constant-time compare.
+# All three are already in the workspace lockfile transitively, so adding
+# them here pulls in no new crates.
+sha2 = "0.10"
+hex = "0.4"
+subtle = "2.6"
+# AES-256-CBC to decrypt Feishu encrypt-key payloads.
+aes = "0.8"
+cbc = { version = "0.1", features = ["alloc"] }
+base64 = "0.22"

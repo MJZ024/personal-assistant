@@ -4,11 +4,25 @@ feishu:
   # 在飞书开放平台获取: https://open.feishu.cn/
   app_id: ""         # 替换为你的 App ID
   app_secret: ""     # 替换为你的 App Secret
-  verification_token: ""  # 替换为你的 Verification Token
+  verification_token: ""  # 替换为你的 Verification Token (token 模式; 见下方 encrypt_key)
+
+  # 【强烈推荐】加密密钥(Encrypt Key)。配置后飞书会:
+  #   1. 对每个回调附带 X-Lark-Signature (我们用 SHA256 校验,防伪造/篡改)
+  #   2. 用 AES-256-CBC 加密事件体 (我们会解密)
+  # 留空则退回仅校验 verification_token 的弱模式。生产环境务必填写。
+  encrypt_key: ""
+
+  # 发送者白名单:只允许这些 open_id 的人下达指令。留空 = 拒绝所有人(默认安全)。
+  # 在飞书发一条消息后查看日志里的 open_id,填到这里。
+  allowed_sender_ids: []
+  #  例如: ["ou_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"]
+
   bot_name: "个人助理"
   max_upload_size: 20971520  # 20MB
   api_base_url: "https://open.feishu.cn/open-apis"
-  listen_addr: "0.0.0.0:8080"
+  # 默认只监听 127.0.0.1。公网暴露请用 nginx/Caddy 做 HTTPS 反代到本端口,
+  # 不要直接把 0.0.0.0:8080 暴露到公网。
+  listen_addr: "127.0.0.1:8080"
 
 supervisor:
   max_concurrent_tasks: 2

@@ -26,10 +26,15 @@ impl AuditLogger {
             std::fs::create_dir_all(parent)?;
         }
 
-        let file = OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(path)?;
+        let file = OpenOptions::new().create(true).append(true).open(path)?;
+
+        // The audit log records every command the agents run, so restrict it
+        // to the owner (0600 on Unix) even though it is created by the parent.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = file.set_permissions(std::fs::Permissions::from_mode(0o600));
+        }
 
         Ok(Self {
             writer: Mutex::new(BufWriter::new(file)),

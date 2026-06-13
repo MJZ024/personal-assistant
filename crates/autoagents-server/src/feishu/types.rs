@@ -10,7 +10,25 @@ pub struct FeishuConfig {
     /// Feishu App Secret.
     pub app_secret: String,
     /// Verification token for event subscriptions.
+    ///
+    /// Required in *token mode* (when `encrypt_key` is unset). In that mode the
+    /// token is the only thing proving a callback came from Feishu, so it must
+    /// be kept secret and the listener must not be exposed to untrusted
+    /// networks without TLS. Prefer configuring `encrypt_key` (signature mode).
     pub verification_token: String,
+    /// Feishu Encrypt Key (a.k.a. Encryption Key) from the developer console.
+    ///
+    /// When set, Feishu signs every callback with `X-Lark-Signature` and
+    /// AES-256-CBC encrypts the payload. This is the strongly recommended mode:
+    /// it defeats request forgery and tampering even over plaintext HTTP.
+    /// When empty, the bot falls back to the weaker `verification_token` check.
+    pub encrypt_key: String,
+    /// Allowlist of Feishu sender `open_id` values permitted to issue commands.
+    ///
+    /// Empty means **nobody** is authorised (fail closed). Populate it with the
+    /// owner's `open_id` so that even an authenticated Feishu user who merely
+    /// messages the bot cannot trigger command execution.
+    pub allowed_sender_ids: Vec<String>,
     /// The bot name for display purposes.
     pub bot_name: String,
     /// Max file size in bytes for user-uploaded files (default 20MB).
@@ -18,6 +36,10 @@ pub struct FeishuConfig {
     /// Feishu API base URL.
     pub api_base_url: String,
     /// HTTP server listen address and port.
+    ///
+    /// Defaults to the loopback interface: expose the callback through a
+    /// TLS-terminating reverse proxy (nginx/Caddy) rather than binding the
+    /// plaintext handler directly to a public interface.
     pub listen_addr: String,
 }
 
@@ -27,10 +49,12 @@ impl Default for FeishuConfig {
             app_id: String::new(),
             app_secret: String::new(),
             verification_token: String::new(),
+            encrypt_key: String::new(),
+            allowed_sender_ids: Vec::new(),
             bot_name: "个人助理".to_string(),
             max_upload_size: 20 * 1024 * 1024, // 20MB
             api_base_url: "https://open.feishu.cn/open-apis".to_string(),
-            listen_addr: "0.0.0.0:8080".to_string(),
+            listen_addr: "127.0.0.1:8080".to_string(),
         }
     }
 }
@@ -40,9 +64,7 @@ impl Default for FeishuConfig {
 #[serde(tag = "type")]
 pub enum FeishuEvent {
     #[serde(rename = "url_verification")]
-    UrlVerification {
-        challenge: String,
-    },
+    UrlVerification { challenge: String },
     #[serde(rename = "im.message.receive_v1")]
     MessageReceive {
         sender: Option<SenderInfo>,

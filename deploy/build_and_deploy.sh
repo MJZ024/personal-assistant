@@ -32,15 +32,28 @@ echo "Binary size: $(du -h "$TARGET_BIN" | cut -f1)"
 # Deploy to 1037U
 echo "=== Deploying to ${TARGET_HOST} ==="
 
-ssh "$TARGET_HOST" "sudo mkdir -p ${TARGET_DIR}/{audit,backups,custom_tools,data}"
+# Ensure a dedicated unprivileged system account + data dir exist. The service
+# runs as this user (see personal-assistant.service), never as root.
+ssh "$TARGET_HOST" "set -e; \
+    sudo useradd --system --no-create-home --shell /usr/sbin/nologin personal-assistant 2>/dev/null || true; \
+    sudo mkdir -p ${TARGET_DIR}/{audit,backups,custom_tools,data}; \
+    sudo chown -R personal-assistant:personal-assistant ${TARGET_DIR}"
 
 scp "$TARGET_BIN" "${TARGET_HOST}:/tmp/${BINARY_NAME}"
-ssh "$TARGET_HOST" "sudo mv /tmp/${BINARY_NAME} /usr/local/bin/${BINARY_NAME} && sudo chmod +x /usr/local/bin/${BINARY_NAME}"
+ssh "$TARGET_HOST" "sudo install -m 0755 -o root -g root /tmp/${BINARY_NAME} /usr/local/bin/${BINARY_NAME}"
 
-# Deploy config if not exists
-ssh "$TARGET_HOST" "if [ ! -f ${TARGET_DIR}/config.yaml ]; then sudo cp ${TARGET_DIR}/config.yaml 2>/dev/null || true; fi" || true
-scp deploy/config.yaml "${TARGET_HOST}:/tmp/config.yaml"
-ssh "$TARGET_HOST" "sudo cp /tmp/config.yaml ${TARGET_DIR}/config.yaml"
+# Ship the *example* config and create a real config.yaml ONLY if one does not
+# already exist — never overwrite a config that holds live secrets.
+scp deploy/config.example.yaml "${TARGET_HOST}:/tmp/config.example.yaml"
+ssh "$TARGET_HOST" "set -e; \
+    sudo install -m 0644 -o personal-assistant -g personal-assistant /tmp/config.example.yaml ${TARGET_DIR}/config.example.yaml; \
+    if [ ! -f ${TARGET_DIR}/config.yaml ]; then \
+        echo 'No config.yaml found — seeding from example. EDIT IT before relying on it.'; \
+        sudo install -m 0600 -o personal-assistant -g personal-assistant /tmp/config.example.yaml ${TARGET_DIR}/config.yaml; \
+    else \
+        sudo chown personal-assistant:personal-assistant ${TARGET_DIR}/config.yaml; \
+        sudo chmod 600 ${TARGET_DIR}/config.yaml; \
+    fi"
 
 # Deploy and enable systemd service
 scp deploy/personal-assistant.service "${TARGET_HOST}:/tmp/"

@@ -730,6 +730,7 @@ dependencies = [
 name = "autoagents-server"
 version = "0.1.0"
 dependencies = [
+ "aes",
  "async-trait",
  "autoagents",
  "autoagents-core",
@@ -739,14 +740,19 @@ dependencies = [
  "autoagents-supervisor",
  "autoagents-tool-auth",
  "axum 0.8.9",
+ "base64 0.22.1",
  "bytes",
+ "cbc",
  "chrono",
  "env_logger",
+ "hex",
  "log",
  "reqwest 0.13.4",
  "serde",
  "serde_json",
  "serde_yaml",
+ "sha2",
+ "subtle",
  "thiserror 2.0.18",
  "tokio",
  "tower 0.5.3",
