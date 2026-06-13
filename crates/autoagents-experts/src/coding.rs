@@ -145,7 +145,13 @@ impl ToolRuntime for ShellExecuteTool {
             .as_ref()
             .ok_or(ToolCallError::RuntimeError("auth not configured".into()))?;
         let (level, warning) = auth.analyze_shell_command(command);
+        let perm = match level {
+            ShellDangerLevel::Safe => PermissionLevel::Safe,
+            ShellDangerLevel::Write => PermissionLevel::Write,
+            _ => PermissionLevel::System,
+        };
         if level == ShellDangerLevel::Unknown || level >= ShellDangerLevel::System {
+            super::record_audit(auth, "coding", "shell_execute", perm, command, "blocked");
             return Err(ToolCallError::RuntimeError(
                 format!(
                     "Command blocked (level: {:?}): {}. User confirmation required.",
@@ -155,6 +161,7 @@ impl ToolRuntime for ShellExecuteTool {
                 .into(),
             ));
         }
+        super::record_audit(auth, "coding", "shell_execute", perm, command, "allowed");
 
         // Confine execution to the agent's working directory under the
         // configured sandbox policy. The per-call `working_dir` arg is
@@ -358,11 +365,28 @@ impl ToolRuntime for GitOperationTool {
                 .as_ref()
                 .ok_or(ToolCallError::RuntimeError("auth not configured".into()))?;
             let check = auth.check("coding", "git_push", PermissionLevel::System);
+            let args = format!("push {repo_path}");
             if check.needs_confirmation() {
+                super::record_audit(
+                    auth,
+                    "coding",
+                    "git_push",
+                    PermissionLevel::System,
+                    &args,
+                    "blocked",
+                );
                 return Err(ToolCallError::RuntimeError(
                     "git push requires user confirmation.".into(),
                 ));
             }
+            super::record_audit(
+                auth,
+                "coding",
+                "git_push",
+                PermissionLevel::System,
+                &args,
+                "allowed",
+            );
         }
 
         let mut cmd = tokio::process::Command::new("git");
