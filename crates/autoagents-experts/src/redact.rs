@@ -100,6 +100,9 @@ mod tests {
     #[test]
     fn handles_empty_and_no_match() {
         assert_eq!(redact_secrets(""), "");
-        assert_eq!(redact_secrets("plain text, no secrets"), "plain text, no secrets");
+        assert_eq!(
+            redact_secrets("plain text, no secrets"),
+            "plain text, no secrets"
+        );
     }
 }

@@ -115,13 +115,9 @@ fn decide(
     let inner: Vec<String> = vec!["sh".into(), "-c".into(), command.into()];
     match policy {
         SandboxPolicy::Off => Ok(inner),
-        SandboxPolicy::Auto if available => {
-            Ok(build_sandbox_argv(working_dir, home, &inner))
-        }
+        SandboxPolicy::Auto if available => Ok(build_sandbox_argv(working_dir, home, &inner)),
         SandboxPolicy::Auto => Ok(inner),
-        SandboxPolicy::Required if available => {
-            Ok(build_sandbox_argv(working_dir, home, &inner))
-        }
+        SandboxPolicy::Required if available => Ok(build_sandbox_argv(working_dir, home, &inner)),
         SandboxPolicy::Required => Err("sandbox required but bwrap is not installed"),
     }
 }
@@ -214,7 +210,10 @@ mod tests {
             .filter(|w| w[0] == "--tmpfs")
             .map(|w| w[1].as_str())
             .collect();
-        assert!(tmpfs_vals.contains(&"/home/me"), "home should be masked: {tmpfs_vals:?}");
+        assert!(
+            tmpfs_vals.contains(&"/home/me"),
+            "home should be masked: {tmpfs_vals:?}"
+        );
     }
 
     #[test]
@@ -266,9 +265,18 @@ mod tests {
 
     #[test]
     fn is_within_lexical() {
-        assert!(is_within("/opt/personal-assistant", "/opt/personal-assistant"));
-        assert!(is_within("/opt/personal-assistant", "/opt/personal-assistant/sub"));
-        assert!(!is_within("/opt/personal-assistant", "/opt/personal-assistant-evil"));
+        assert!(is_within(
+            "/opt/personal-assistant",
+            "/opt/personal-assistant"
+        ));
+        assert!(is_within(
+            "/opt/personal-assistant",
+            "/opt/personal-assistant/sub"
+        ));
+        assert!(!is_within(
+            "/opt/personal-assistant",
+            "/opt/personal-assistant-evil"
+        ));
         assert!(!is_within("/home", "/opt"));
     }
 
@@ -292,7 +300,10 @@ mod tests {
         let with_bwrap = decide(SandboxPolicy::Auto, true, "/w", None, "ls").unwrap();
         assert!(is_sandboxed(&with_bwrap));
         let without = decide(SandboxPolicy::Auto, false, "/w", None, "ls").unwrap();
-        assert!(!is_sandboxed(&without), "Auto must fall back when bwrap absent");
+        assert!(
+            !is_sandboxed(&without),
+            "Auto must fall back when bwrap absent"
+        );
     }
 
     #[test]
@@ -300,12 +311,22 @@ mod tests {
         let with_bwrap = decide(SandboxPolicy::Required, true, "/w", None, "ls").unwrap();
         assert!(is_sandboxed(&with_bwrap));
         let refused = decide(SandboxPolicy::Required, false, "/w", None, "ls");
-        assert!(refused.is_err(), "Required without bwrap must refuse (fail-closed)");
+        assert!(
+            refused.is_err(),
+            "Required without bwrap must refuse (fail-closed)"
+        );
     }
 
     #[test]
     fn sandboxed_argv_carries_command_and_working_dir() {
-        let argv = decide(SandboxPolicy::Required, true, "/home/me/repo", None, "make test").unwrap();
+        let argv = decide(
+            SandboxPolicy::Required,
+            true,
+            "/home/me/repo",
+            None,
+            "make test",
+        )
+        .unwrap();
         // inner command is the tail after "--"
         let sep = argv.iter().position(|a| a == "--").unwrap();
         assert_eq!(&argv[sep + 1..], &["sh", "-c", "make test"]);

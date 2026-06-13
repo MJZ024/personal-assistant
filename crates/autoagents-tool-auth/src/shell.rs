@@ -121,10 +121,9 @@ fn base_command_level(cmd: &str) -> ShellDangerLevel {
     // | sh`, etc. This is defence-in-depth; the bubblewrap sandbox is the
     // real backstop (it cuts network + hides secret paths regardless).
     let exec_vectors = [
-        "sh", "bash", "dash", "zsh", "ksh", "ash", "csh", "tcsh", "fish",
-        "python", "python2", "python3", "node", "perl", "ruby", "php", "lua",
-        "tclsh", "expect", "xargs", "tar", "nc", "ncat", "socat", "busybox",
-        "env", "exec", "curl", "wget",
+        "sh", "bash", "dash", "zsh", "ksh", "ash", "csh", "tcsh", "fish", "python", "python2",
+        "python3", "node", "perl", "ruby", "php", "lua", "tclsh", "expect", "xargs", "tar", "nc",
+        "ncat", "socat", "busybox", "env", "exec", "curl", "wget",
     ];
     if exec_vectors.contains(&base.as_str()) {
         return ShellDangerLevel::Destructive;
@@ -316,9 +315,18 @@ mod tests {
     #[test]
     fn find_with_exec_or_delete_is_destructive() {
         let analyzer = ShellAnalyzer::new(vec![], vec![]).unwrap();
-        assert_eq!(analyzer.analyze("find / -delete").0, ShellDangerLevel::Destructive);
-        assert_eq!(analyzer.analyze("find . -exec cat {} ;").0, ShellDangerLevel::Destructive);
-        assert_eq!(analyzer.analyze("find . -ok rm {} ;").0, ShellDangerLevel::Destructive);
+        assert_eq!(
+            analyzer.analyze("find / -delete").0,
+            ShellDangerLevel::Destructive
+        );
+        assert_eq!(
+            analyzer.analyze("find . -exec cat {} ;").0,
+            ShellDangerLevel::Destructive
+        );
+        assert_eq!(
+            analyzer.analyze("find . -ok rm {} ;").0,
+            ShellDangerLevel::Destructive
+        );
     }
 
     #[test]
@@ -328,6 +336,9 @@ mod tests {
         assert_eq!(analyzer.analyze("ls -la").0, ShellDangerLevel::Safe);
         assert_eq!(analyzer.analyze("cat file.txt").0, ShellDangerLevel::Safe);
         assert_eq!(analyzer.analyze("grep -rn foo .").0, ShellDangerLevel::Safe);
-        assert_eq!(analyzer.analyze("find . -name '*.rs'").0, ShellDangerLevel::Safe);
+        assert_eq!(
+            analyzer.analyze("find . -name '*.rs'").0,
+            ShellDangerLevel::Safe
+        );
     }
 }

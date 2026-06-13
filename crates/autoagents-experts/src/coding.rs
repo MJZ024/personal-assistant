@@ -8,9 +8,9 @@ use autoagents_core::tool::{ToolCallError, ToolRuntime, ToolT};
 
 use autoagents_tool_auth::{PermissionLevel, ShellDangerLevel};
 
-use super::redact::redact_secrets;
-use super::sandbox::{resolve_argv, SandboxPolicy};
 use super::ExpertAgent;
+use super::redact::redact_secrets;
+use super::sandbox::{SandboxPolicy, resolve_argv};
 
 // ── Agent Definition ──
 
@@ -244,7 +244,9 @@ impl ToolRuntime for ReadFileTool {
             .map_err(|e| ToolCallError::RuntimeError(e.to_string().into()))?;
         let lines: Vec<&str> = contents.lines().take(max_lines).collect();
 
-        Ok(serde_json::json!({ "path": path, "lines": lines.len(), "content": redact_secrets(&lines.join("\n")) }))
+        Ok(
+            serde_json::json!({ "path": path, "lines": lines.len(), "content": redact_secrets(&lines.join("\n")) }),
+        )
     }
 }
 
@@ -534,6 +536,9 @@ mod tests {
         let res = tool
             .execute(serde_json::json!({"pattern":"x","directory":"../../../etc"}))
             .await;
-        assert!(res.is_err(), "code_search must reject traversal outside root");
+        assert!(
+            res.is_err(),
+            "code_search must reject traversal outside root"
+        );
     }
 }

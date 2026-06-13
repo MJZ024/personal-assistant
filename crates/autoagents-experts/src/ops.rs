@@ -8,8 +8,8 @@ use autoagents_core::tool::{ToolCallError, ToolRuntime, ToolT};
 
 use autoagents_tool_auth::PermissionLevel;
 
-use super::redact::redact_secrets;
 use super::ExpertAgent;
+use super::redact::redact_secrets;
 
 // ── Agent Definition ──
 
@@ -493,9 +493,15 @@ mod tests {
         let res = tool
             .execute(serde_json::json!({"action": "kill", "pid": 99999}))
             .await;
-        assert!(res.is_err(), "kill must be blocked by the confirmation gate");
+        assert!(
+            res.is_err(),
+            "kill must be blocked by the confirmation gate"
+        );
         let audit = std::fs::read_to_string(path).expect("audit log written");
-        assert!(audit.contains("process_manage"), "audit missing tool: {audit}");
+        assert!(
+            audit.contains("process_manage"),
+            "audit missing tool: {audit}"
+        );
         assert!(audit.contains("blocked"), "audit missing result: {audit}");
     }
 }
