@@ -41,7 +41,10 @@ impl FeishuClient {
             }
         }
 
-        let url = format!("{}/auth/v3/tenant_access_token/internal", self.config.api_base_url);
+        let url = format!(
+            "{}/auth/v3/tenant_access_token/internal",
+            self.config.api_base_url
+        );
         let resp = self
             .client
             .post(&url)
@@ -152,11 +155,7 @@ impl FeishuClient {
     }
 
     /// Send a file message.
-    pub async fn send_file(
-        &self,
-        chat_id: &str,
-        file_key: &str,
-    ) -> Result<String, String> {
+    pub async fn send_file(&self, chat_id: &str, file_key: &str) -> Result<String, String> {
         let token = self.get_access_token().await?;
         let url = format!(
             "{}/im/v1/messages?receive_id_type=chat_id",
@@ -189,11 +188,7 @@ impl FeishuClient {
     }
 
     /// Download a file from Feishu.
-    pub async fn download_file(
-        &self,
-        message_id: &str,
-        file_key: &str,
-    ) -> Result<Vec<u8>, String> {
+    pub async fn download_file(&self, message_id: &str, file_key: &str) -> Result<Vec<u8>, String> {
         let token = self.get_access_token().await?;
         let url = format!(
             "{}/im/v1/messages/{}/resources/{}?type=file",
@@ -208,7 +203,10 @@ impl FeishuClient {
             .await
             .map_err(|e| format!("Download failed: {}", e))?;
 
-        let bytes = resp.bytes().await.map_err(|e| format!("Read bytes failed: {}", e))?;
+        let bytes = resp
+            .bytes()
+            .await
+            .map_err(|e| format!("Read bytes failed: {}", e))?;
 
         // Check size limit
         if bytes.len() as u64 > self.config.max_upload_size {
@@ -242,7 +240,10 @@ impl FeishuClient {
             .await
             .map_err(|e| format!("Download failed: {}", e))?;
 
-        let bytes = resp.bytes().await.map_err(|e| format!("Read bytes failed: {}", e))?;
+        let bytes = resp
+            .bytes()
+            .await
+            .map_err(|e| format!("Read bytes failed: {}", e))?;
         Ok(bytes.to_vec())
     }
 }

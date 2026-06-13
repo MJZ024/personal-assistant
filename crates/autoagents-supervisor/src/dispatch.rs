@@ -53,7 +53,9 @@ impl ExpertDispatcher {
 
         log::info!(
             "Dispatched task {} ({}) to {} expert",
-            task_id, description, task_type
+            task_id,
+            description,
+            task_type
         );
 
         Ok(())
@@ -72,10 +74,7 @@ impl ExpertDispatcher {
             )));
         }
 
-        log::info!(
-            "Sent follow-up to task {}: {}",
-            task_id, message
-        );
+        log::info!("Sent follow-up to task {}: {}", task_id, message);
 
         Ok(())
     }
