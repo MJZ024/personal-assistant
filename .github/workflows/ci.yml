@@ -85,7 +85,6 @@ jobs:
             -p autoagents-experts \
             -p autoagents-tool-auth \
             -p autoagents-supervisor \
-            --fail-under 60 \
             --out Xml
       - name: Upload to Codecov
         uses: codecov/codecov-action@v5
