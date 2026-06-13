@@ -131,10 +131,7 @@ impl ToolAuthInterceptor {
 
     /// Analyze a shell command and return its danger level.
     /// Combines AST analysis with regex-based pattern matching.
-    pub fn analyze_shell_command(
-        &self,
-        command: &str,
-    ) -> (ShellDangerLevel, Option<String>) {
+    pub fn analyze_shell_command(&self, command: &str) -> (ShellDangerLevel, Option<String>) {
         self.shell_analyzer.analyze(command)
     }
 
@@ -144,7 +141,10 @@ impl ToolAuthInterceptor {
     }
 
     /// Reload configuration from YAML.
-    pub fn reload_config(&mut self, config: ToolAuthConfig) -> Result<(), Box<dyn std::error::Error>> {
+    pub fn reload_config(
+        &mut self,
+        config: ToolAuthConfig,
+    ) -> Result<(), Box<dyn std::error::Error>> {
         self.shell_analyzer = ShellAnalyzer::new(
             config.shell_blacklist_patterns.clone(),
             config.shell_whitelist_patterns.clone(),

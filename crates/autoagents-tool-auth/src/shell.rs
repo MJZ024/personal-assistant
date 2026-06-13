@@ -37,14 +37,10 @@ impl ShellAnalyzer {
         blacklist_patterns: Vec<String>,
         whitelist_patterns: Vec<String>,
     ) -> Result<Self, regex::Error> {
-        let blacklist: Result<Vec<_>, _> = blacklist_patterns
-            .iter()
-            .map(|p| Regex::new(p))
-            .collect();
-        let whitelist: Result<Vec<_>, _> = whitelist_patterns
-            .iter()
-            .map(|p| Regex::new(p))
-            .collect();
+        let blacklist: Result<Vec<_>, _> =
+            blacklist_patterns.iter().map(|p| Regex::new(p)).collect();
+        let whitelist: Result<Vec<_>, _> =
+            whitelist_patterns.iter().map(|p| Regex::new(p)).collect();
 
         Ok(Self {
             blacklist: blacklist?,
@@ -119,19 +115,38 @@ fn base_command_level(cmd: &str) -> ShellDangerLevel {
     let base = cmd.split_whitespace().next().unwrap_or(cmd).to_lowercase();
 
     // Destructive commands
-    let destructive = [
-        "rm", "mkfs", "dd", "fdisk", "parted", "shred", "wipe",
-    ];
+    let destructive = ["rm", "mkfs", "dd", "fdisk", "parted", "shred", "wipe"];
     if destructive.contains(&base.as_str()) {
         return ShellDangerLevel::Destructive;
     }
 
     // System commands
     let system = [
-        "apt", "apt-get", "yum", "dnf", "pacman", "pip", "pip3", "npm",
-        "systemctl", "service", "chkconfig", "reboot", "shutdown", "halt",
-        "mount", "umount", "chown", "chmod", "useradd", "usermod", "passwd",
-        "iptables", "firewall-cmd", "ufw", "docker",
+        "apt",
+        "apt-get",
+        "yum",
+        "dnf",
+        "pacman",
+        "pip",
+        "pip3",
+        "npm",
+        "systemctl",
+        "service",
+        "chkconfig",
+        "reboot",
+        "shutdown",
+        "halt",
+        "mount",
+        "umount",
+        "chown",
+        "chmod",
+        "useradd",
+        "usermod",
+        "passwd",
+        "iptables",
+        "firewall-cmd",
+        "ufw",
+        "docker",
     ];
     if system.contains(&base.as_str()) {
         return ShellDangerLevel::System;
@@ -139,8 +154,7 @@ fn base_command_level(cmd: &str) -> ShellDangerLevel {
 
     // Write commands
     let write = [
-        "cp", "mv", "touch", "mkdir", "rmdir", "tee", "ln",
-        "git", "tar", "gzip", "zip", "unzip",
+        "cp", "mv", "touch", "mkdir", "rmdir", "tee", "ln", "git", "tar", "gzip", "zip", "unzip",
     ];
     if write.contains(&base.as_str()) {
         return ShellDangerLevel::Write;
@@ -172,29 +186,37 @@ mod tests {
         let analyzer = ShellAnalyzer::new(vec![], vec![]).unwrap();
         assert_eq!(analyzer.analyze("cp a b").0, ShellDangerLevel::Write);
         assert_eq!(analyzer.analyze("mv a b").0, ShellDangerLevel::Write);
-        assert_eq!(analyzer.analyze("echo hello > file.txt").0, ShellDangerLevel::Write);
+        assert_eq!(
+            analyzer.analyze("echo hello > file.txt").0,
+            ShellDangerLevel::Write
+        );
     }
 
     #[test]
     fn test_system_commands() {
         let analyzer = ShellAnalyzer::new(vec![], vec![]).unwrap();
-        assert_eq!(analyzer.analyze("apt install vim").0, ShellDangerLevel::System);
-        assert_eq!(analyzer.analyze("systemctl restart nginx").0, ShellDangerLevel::System);
+        assert_eq!(
+            analyzer.analyze("apt install vim").0,
+            ShellDangerLevel::System
+        );
+        assert_eq!(
+            analyzer.analyze("systemctl restart nginx").0,
+            ShellDangerLevel::System
+        );
     }
 
     #[test]
     fn test_destructive_commands() {
         let analyzer = ShellAnalyzer::new(vec![], vec![]).unwrap();
-        assert_eq!(analyzer.analyze("rm -rf /tmp/test").0, ShellDangerLevel::Destructive);
+        assert_eq!(
+            analyzer.analyze("rm -rf /tmp/test").0,
+            ShellDangerLevel::Destructive
+        );
     }
 
     #[test]
     fn test_blacklist_pattern() {
-        let analyzer = ShellAnalyzer::new(
-            vec![r"rm\s+(-[rRf]+\s+)*/".into()],
-            vec![],
-        )
-        .unwrap();
+        let analyzer = ShellAnalyzer::new(vec![r"rm\s+(-[rRf]+\s+)*/".into()], vec![]).unwrap();
         let (level, warning) = analyzer.analyze("rm -rf /");
         assert_eq!(level, ShellDangerLevel::Destructive);
         assert!(warning.is_some());

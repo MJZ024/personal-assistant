@@ -70,10 +70,7 @@ pub trait ToolPermission {
 
 /// Permission check helper.
 pub trait PermissionCheck {
-    fn check_permission(
-        &self,
-        agent_cap: PermissionLevel,
-    ) -> PermissionResult;
+    fn check_permission(&self, agent_cap: PermissionLevel) -> PermissionResult;
 }
 
 #[cfg(test)]
@@ -83,7 +80,12 @@ mod tests {
     #[test]
     fn test_safe_allowed_for_all_agents() {
         // Any agent can execute Safe tools
-        for cap in &[PermissionLevel::Safe, PermissionLevel::Write, PermissionLevel::System, PermissionLevel::Destructive] {
+        for cap in &[
+            PermissionLevel::Safe,
+            PermissionLevel::Write,
+            PermissionLevel::System,
+            PermissionLevel::Destructive,
+        ] {
             assert!(*cap >= PermissionLevel::Safe);
         }
     }
@@ -128,7 +130,9 @@ mod tests {
 
     #[test]
     fn test_permission_result_denied() {
-        let r = PermissionResult::Denied { reason: "nope".into() };
+        let r = PermissionResult::Denied {
+            reason: "nope".into(),
+        };
         assert!(!r.is_allowed());
         assert!(!r.needs_confirmation());
     }
