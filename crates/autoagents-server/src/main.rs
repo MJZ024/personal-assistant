@@ -6,10 +6,11 @@
 
 mod config;
 mod feishu;
+mod runner;
 
 use std::sync::Arc;
 
-use axum::{routing::post, Router};
+use axum::{Router, routing::post};
 use tower_http::limit::RequestBodyLimitLayer;
 use tower_http::trace::TraceLayer;
 
@@ -18,13 +19,12 @@ use autoagents_supervisor::Supervisor;
 use autoagents_tool_auth::ToolAuthInterceptor;
 
 use config::AppConfig;
-use feishu::{events::AppState, FeishuClient};
+use feishu::{FeishuClient, events::AppState};
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Initialize logging
-    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info"))
-        .init();
+    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
 
     log::info!("Starting Personal Assistant...");
 
@@ -62,10 +62,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         wal_checkpoint_interval_secs: app_config.supervisor.wal_checkpoint_interval_secs,
     };
     let supervisor_for_heartbeat = supervisor.clone();
-    let heartbeat = Heartbeat::new(heartbeat_db, heartbeat_config)
-        .on_tick(move |tasks| {
-            log::debug!("Heartbeat: {} active tasks", tasks.len());
-        });
+    let heartbeat = Heartbeat::new(heartbeat_db, heartbeat_config).on_tick(move |tasks| {
+        log::debug!("Heartbeat: {} active tasks", tasks.len());
+    });
 
     tokio::spawn(async move {
         heartbeat.run().await;

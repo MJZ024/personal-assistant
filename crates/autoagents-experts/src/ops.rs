@@ -3,7 +3,7 @@
 use serde_json::Value;
 use std::sync::Arc;
 
-use autoagents_core::agent::AgentDeriveT;
+use autoagents_core::agent::{AgentDeriveT, AgentHooks};
 use autoagents_core::tool::{ToolCallError, ToolRuntime, ToolT};
 
 use autoagents_tool_auth::PermissionLevel;
@@ -53,6 +53,9 @@ impl AgentDeriveT for OpsAgent {
         ]
     }
 }
+
+// ReActAgent requires this; all methods carry sensible defaults.
+impl AgentHooks for OpsAgent {}
 
 #[async_trait::async_trait]
 impl ExpertAgent for OpsAgent {
