@@ -283,6 +283,11 @@ impl<T: AgentDeriveT + AgentHooks> AgentExecutor for ReActAgent<T> {
         let max_turns = self.config().max_turns;
         let mut accumulated_tool_calls = Vec::new();
         let mut final_response = String::new();
+        eprintln!(
+            "  ⏳ {} agent started (max {} turns)",
+            self.inner.name(),
+            max_turns
+        );
         for turn_index in 0..max_turns {
             let result = engine
                 .run_turn(self, task, &context, &mut turn_state, turn_index, max_turns)
@@ -304,6 +309,20 @@ impl<T: AgentDeriveT + AgentHooks> AgentExecutor for ReActAgent<T> {
                     if !output.response.is_empty() {
                         final_response = output.response;
                     }
+                    // Per-turn progress (stderr — visible during REPL, doesn't
+                    // pollute the final response on stdout).
+                    let names: Vec<String> = output
+                        .tool_calls
+                        .iter()
+                        .map(|t| t.tool_name.clone())
+                        .collect();
+                    let recent_tools = if names.is_empty() {
+                        "thinking…".to_string()
+                    } else {
+                        names.join(", ")
+                    };
+                    eprintln!("  [{}/{}] {}", turn_index + 1, max_turns, recent_tools);
+
                     accumulated_tool_calls.extend(output.tool_calls);
                     accumulated_tool_calls = dedupe_tool_calls(accumulated_tool_calls);
                 }

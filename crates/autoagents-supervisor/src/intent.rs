@@ -151,9 +151,10 @@ fn detect_task_type(message: &str) -> String {
         "function",
         "implement",
         "fix",
-        // File/directory inspection (shell-driven → coding agent)
+        // File/directory operations (shell-driven → coding agent)
         "列出",
         "目录",
+        "创建",
     ];
     for kw in &coding_kw {
         if msg.contains(kw) {
