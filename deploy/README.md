@@ -76,6 +76,20 @@ deploy/
 - `/help` - 查看帮助
 - `/reload` - 重新加载配置
 
+## 待实现功能
+
+### #6 危险操作确认机制(Feishu 交互卡片)
+
+**当前状态**:System/Destructive 级工具（`service_control` 的 restart/stop/start、`process_manage` 的 kill）已从 ops agent 的工具列表中移除，等效于永远不暴露给 LLM。ops agent 目前仅提供只读监测能力（`system_status`、`log_view`、`cron_task`）。
+
+**为什么当前不做**:确认流需要新 webhook 端点 + 待确认任务表 + Agent 执行模型改动（fire-and-report → 挂起→等用户→恢复），是一个中等规模的子系统。对于单人维护的个人服务器来说，投入产出比暂时不划算——大部分运维需求（看状态、查日志）现在就能满足，需要动手（重启服务、杀进程）时 SSH 更快。
+
+**实现时机**:部署后用一段时间，如果真实场景中频繁需要通过飞书远程操作服务器（而非 SSH），再回来做。工具代码保留在 `crates/autoagents-experts/src/ops.rs` 中（已注释），恢复只需：
+
+1. 实现 Feishu approve/deny 交互卡片（回调端点 + 待确认任务存储 + 超时清理）
+2. 取消 `ops.rs` 中 `tools()` 列表的注释
+3. Agent 重新获得这些工具，每次调用 System/Destructive 操作时触发确认卡片
+
 ## 容量规划 (1037U)
 
 - 内存预算: < 300MB

@@ -45,12 +45,17 @@ impl AgentDeriveT for OpsAgent {
     }
 
     fn tools(&self) -> Vec<Box<dyn ToolT>> {
+        // Read-only tools only. ServiceControl (restart/stop/start) and
+        // ProcessManage (kill) are disabled until #6 (confirmation flow) is
+        // implemented — see deploy/README.md § "待实现功能".
+        // To re-enable, restore the commented lines below and build the
+        // Feishu approve/deny interactive-card flow.
         vec![
             Box::new(SystemStatusTool),
-            Box::new(ServiceControlTool::new(self.auth.clone())),
+            // Box::new(ServiceControlTool::new(self.auth.clone())),  // #6 blocked
             Box::new(LogViewTool),
             Box::new(CronTaskTool::new(self.auth.clone())),
-            Box::new(ProcessManageTool::new(self.auth.clone())),
+            // Box::new(ProcessManageTool::new(self.auth.clone())),   // #6 blocked
         ]
     }
 }
