@@ -55,14 +55,16 @@ pub async fn event_loop(
                 app.status = format!("{} | idle", app.model_desc);
             }
 
-            // ── Agent progress (tool calls per turn) ──
-            Some(tool_names) = progress_rx.recv() => {
+            // ── Agent progress (tool calls per turn: "name|ok/err|snippet") ──
+            Some(raw) = progress_rx.recv() => {
                 if app.follow_bottom { app.scroll_offset = 0; }
-                for name in tool_names.split(", ") {
-                    if !name.is_empty() && name != "thinking…" {
-                        if let Some(msg) = app.last_assistant_mut() {
-                            msg.push_tool(name, true, "");
-                        }
+                let mut parts = raw.splitn(3, '|');
+                let name = parts.next().unwrap_or("");
+                let ok = parts.next().unwrap_or("ok") != "err";
+                let snippet = parts.next().unwrap_or("");
+                if !name.is_empty() && name != "thinking…" {
+                    if let Some(msg) = app.last_assistant_mut() {
+                        msg.push_tool(name, ok, snippet);
                     }
                 }
             }

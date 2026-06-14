@@ -343,7 +343,20 @@ impl<T: AgentDeriveT + AgentHooks> AgentExecutor for ReActAgent<T> {
                     // disconnects quietly.
                     #[cfg(not(target_arch = "wasm32"))]
                     if let Some(ref tx) = self.progress_tx {
-                        let _ = tx.send(recent_tools.clone());
+                        for tc in &output.tool_calls {
+                            let snippet: String = tc.result.to_string();
+                            let short = if snippet.len() > 120 {
+                                format!("{}…", &snippet[..120])
+                            } else {
+                                snippet
+                            };
+                            let _ = tx.send(format!(
+                                "{}|{}|{}",
+                                tc.tool_name,
+                                if tc.success { "ok" } else { "err" },
+                                short
+                            ));
+                        }
                     } else {
                         eprintln!("  [{}/{}] {}", turn_index + 1, max_turns, recent_tools);
                     }
