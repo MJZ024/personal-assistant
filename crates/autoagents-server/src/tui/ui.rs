@@ -60,7 +60,10 @@ pub fn render(f: &mut Frame, app: &TuiApp) {
 
     // ── Input line (single row, no border) ──
     let prompt = if app.agent_running {
-        Span::styled("  ⏳ (waiting for agent…)", Style::default().fg(C_MUTED))
+        Line::from(vec![Span::styled(
+            "  ⏳ (waiting for agent…)",
+            Style::default().fg(C_MUTED),
+        )])
     } else {
         let (before, after) = if app.input.is_empty() {
             ("", "│")
