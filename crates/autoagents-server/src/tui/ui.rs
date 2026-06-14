@@ -34,19 +34,12 @@ pub fn render(f: &mut Frame, app: &TuiApp) {
 
     // ── Body ──
     let mut lines: Vec<Line> = Vec::new();
-    // Header
-    lines.push(Line::from(vec![
-        Span::styled(
-            "  personal-assistant",
-            Style::default().fg(C_CYAN).add_modifier(Modifier::BOLD),
-        ),
-        Span::raw("        "),
-        Span::styled(&app.model_desc, Style::default().fg(C_MUTED)),
-        Span::styled(
-            "  ●",
-            Style::default().fg(if app.agent_running { C_CYAN } else { C_DIM }),
-        ),
-    ]));
+    // Header: project name + model (simple, fits one line)
+    let header = format!("  personal-assistant        {}  ●", app.model_desc);
+    lines.push(Line::from(vec![Span::styled(
+        header,
+        Style::default().fg(C_DIM),
+    )]));
     lines.push(Line::from(""));
 
     // Messages

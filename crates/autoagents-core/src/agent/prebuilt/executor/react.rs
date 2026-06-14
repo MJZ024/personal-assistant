@@ -344,8 +344,9 @@ impl<T: AgentDeriveT + AgentHooks> AgentExecutor for ReActAgent<T> {
                     #[cfg(not(target_arch = "wasm32"))]
                     if let Some(ref tx) = self.progress_tx {
                         let _ = tx.send(recent_tools.clone());
+                    } else {
+                        eprintln!("  [{}/{}] {}", turn_index + 1, max_turns, recent_tools);
                     }
-                    eprintln!("  [{}/{}] {}", turn_index + 1, max_turns, recent_tools);
 
                     accumulated_tool_calls.extend(output.tool_calls);
                     accumulated_tool_calls = dedupe_tool_calls(accumulated_tool_calls);
