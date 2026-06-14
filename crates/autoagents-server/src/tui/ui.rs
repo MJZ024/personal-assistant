@@ -20,25 +20,30 @@ const C_TOOL_BG: Color = Color::Rgb(30, 30, 40);
 
 pub fn render(f: &mut Frame, app: &TuiApp) {
     let area = f.area();
+    let max_w = area.width.saturating_sub(4) as usize;
 
-    // ── Layout: everything fills, input is last line ──
-    let [body_area, input_area] =
-        Layout::vertical([Constraint::Min(0), Constraint::Length(1)]).areas(area);
+    // ── Layout ──
+    let [body_area, input_area, footer_area] = Layout::vertical([
+        Constraint::Min(0),
+        Constraint::Length(1),
+        Constraint::Length(1),
+    ])
+    .areas(area);
 
-    // ── Messages ──
+    // ── Messages body ──
     let mut lines: Vec<Line> = Vec::new();
-    // Subtle model line at top (like Claude Code's header)
-    let status_line = if app.agent_running {
+    // Header: model line (dim, right-aligned feel)
+    let header = if app.agent_running {
         format!(
-            "  {}  ●  {}  ⏳",
+            "{}  ●  ⏳ {}",
             app.model_desc,
             app.status.split(" | ").last().unwrap_or("running…")
         )
     } else {
-        format!("  {}  ●", app.model_desc)
+        format!("{}  ●", app.model_desc)
     };
     lines.push(Line::from(vec![Span::styled(
-        status_line,
+        format!("  {header}"),
         Style::default().fg(C_DIM),
     )]));
     lines.push(Line::from(""));
@@ -46,43 +51,50 @@ pub fn render(f: &mut Frame, app: &TuiApp) {
     for msg in &app.messages {
         render_message(msg, &mut lines, area.width.saturating_sub(4));
     }
-    if app.agent_running {
-        lines.push(Line::from(""));
-    }
 
-    let total_lines = lines.len().saturating_sub(1);
-    let max_scroll = total_lines.saturating_sub(body_area.height.saturating_sub(1) as usize);
-    let offset = app.scroll_offset.min(max_scroll);
+    let total = lines.len().saturating_sub(1);
+    let max_scroll = total.saturating_sub(body_area.height.saturating_sub(1) as usize);
+    let off = app.scroll_offset.min(max_scroll);
     let history = Paragraph::new(lines)
         .wrap(Wrap { trim: false })
-        .scroll((offset as u16, 0));
+        .scroll((off as u16, 0));
     f.render_widget(history, body_area);
 
-    // ── Input line (single row, no border) ──
-    let prompt = if app.agent_running {
-        Line::from(vec![Span::styled(
-            "  ⏳ (waiting for agent…)",
-            Style::default().fg(C_MUTED),
-        )])
+    // ── Separator + input ──
+    let input_text = if app.agent_running {
+        "  ⏳ waiting…".to_string()
     } else {
-        let (before, after) = if app.input.is_empty() {
-            ("", "│")
-        } else {
-            let p = app.cursor.min(app.input.len());
-            (&app.input[..p], &app.input[p..])
-        };
-        Line::from(vec![
-            Span::styled(
-                "❯ ",
-                Style::default().fg(C_PRIMARY).add_modifier(Modifier::BOLD),
-            ),
-            Span::raw(before),
-            Span::styled("│", Style::default().fg(C_PRIMARY)),
-            Span::raw(after),
-        ])
+        let c = app.cursor.min(app.input.len());
+        format!(
+            "❯ {}{}│{}",
+            &app.input[..c],
+            if app.input.is_empty() { "" } else { "" },
+            &app.input[c..]
+        )
     };
-    let input_widget = Paragraph::new(prompt);
-    f.render_widget(input_widget, input_area);
+    f.render_widget(
+        Paragraph::new(vec![
+            Line::from(vec![Span::styled(
+                "─".repeat(max_w),
+                Style::default().fg(C_DIM),
+            )]),
+            Line::from(vec![Span::styled(
+                input_text,
+                Style::default().fg(C_PRIMARY).add_modifier(Modifier::BOLD),
+            )]),
+        ]),
+        input_area,
+    );
+
+    // ── Footer ──
+    let footer = format!("  ? help  esc quit  pgup/pgdn scroll");
+    f.render_widget(
+        Paragraph::new(Line::from(vec![Span::styled(
+            footer,
+            Style::default().fg(C_DIM),
+        )])),
+        footer_area,
+    );
 }
 
 // ── Message rendering ──
@@ -107,7 +119,7 @@ fn render_message(msg: &super::app::Message, lines: &mut Vec<Line>, wrap_w: u16)
             )]));
         }
     }
-    lines.push(Line::from("")); // blank after badge
+    lines.push(Line::from(""));
 
     for part in &msg.parts {
         match part {
@@ -140,7 +152,7 @@ fn render_message(msg: &super::app::Message, lines: &mut Vec<Line>, wrap_w: u16)
             }
         }
     }
-    lines.push(Line::from("")); // blank after message
+    lines.push(Line::from(""));
 }
 
 fn render_tool_block(lines: &mut Vec<Line>, name: &str, success: bool, result: &str, width: u16) {

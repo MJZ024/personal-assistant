@@ -16,6 +16,22 @@ use autoagents_tool_auth::ToolAuthInterceptor;
 
 use crate::config::AppConfig;
 
+/// Detect which provider actually has a key set and return a human-readable
+/// description. Falls back to the primary config entry if nothing is set.
+fn actual_model_desc(cfg: &AppConfig) -> String {
+    let agent = match cfg.models.agents.iter().find(|a| a.name == "coding") {
+        Some(a) => a,
+        None => return "unknown".into(),
+    };
+    let candidates = std::iter::once(&agent.primary).chain(agent.fallbacks.iter());
+    for p in candidates {
+        if std::env::var(&p.api_key_env).map_or(false, |v| !v.trim().is_empty()) {
+            return format!("{} · {}", p.provider, p.model);
+        }
+    }
+    format!("{} · {}", agent.primary.provider, agent.primary.model)
+}
+
 /// Entry point for TUI mode.
 pub async fn run_tui(app_config: AppConfig, auth: Arc<ToolAuthInterceptor>) {
     // ── Fallback: piped or non-interactive ──
@@ -50,13 +66,7 @@ pub async fn run_tui(app_config: AppConfig, auth: Arc<ToolAuthInterceptor>) {
         autoagents_experts::sandbox::SandboxPolicy::Auto,
     );
 
-    let model_desc = app_config
-        .models
-        .agents
-        .iter()
-        .find(|a| a.name == "coding")
-        .map(|a| format!("{} · {}", a.primary.provider, a.primary.model))
-        .unwrap_or_else(|| "unknown".into());
+    let model_desc = actual_model_desc(&app_config);
 
     // ── Terminal setup ──
     let mut stdout = std::io::stdout();
