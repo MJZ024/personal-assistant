@@ -1,4 +1,4 @@
-//! Minimal TUI rendering — Claude Code style.
+//! Pixel-level Claude Code clone.
 
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout};
@@ -8,91 +8,108 @@ use ratatui::widgets::{Paragraph, Wrap};
 
 use super::app::{MessageRole, Part, TuiApp};
 
-const C_TEXT: Color = Color::White;
-const C_MUTED: Color = Color::Gray;
+const C_WHITE: Color = Color::White;
 const C_DIM: Color = Color::DarkGray;
-const C_PRIMARY: Color = Color::Cyan;
-const C_ACCENT: Color = Color::LightGreen;
-const C_SUCCESS: Color = Color::Green;
-const C_ERROR: Color = Color::Red;
-const C_BORDER: Color = Color::Gray;
+const C_MUTED: Color = Color::Gray;
+const C_CYAN: Color = Color::Cyan;
+const C_GREEN: Color = Color::LightGreen;
+const C_RED: Color = Color::Red;
+const C_BORDER: Color = Color::DarkGray;
 const C_TOOL_BG: Color = Color::Rgb(30, 30, 40);
 
 pub fn render(f: &mut Frame, app: &TuiApp) {
     let area = f.area();
-    let max_w = area.width.saturating_sub(4) as usize;
+    let w = area.width as usize;
+    let sep = "─".repeat(w.saturating_sub(2));
 
     // ── Layout ──
-    let [body_area, input_area, footer_area] = Layout::vertical([
+    let [body_area, sep1_area, input_area, sep2_area, footer_area] = Layout::vertical([
         Constraint::Min(0),
+        Constraint::Length(1),
+        Constraint::Length(1),
         Constraint::Length(1),
         Constraint::Length(1),
     ])
     .areas(area);
 
-    // ── Messages body ──
+    // ── Body ──
     let mut lines: Vec<Line> = Vec::new();
-    // Header: model line (dim, right-aligned feel)
-    let header = if app.agent_running {
-        format!(
-            "{}  ●  ⏳ {}",
-            app.model_desc,
-            app.status.split(" | ").last().unwrap_or("running…")
-        )
-    } else {
-        format!("{}  ●", app.model_desc)
-    };
-    lines.push(Line::from(vec![Span::styled(
-        format!("  {header}"),
-        Style::default().fg(C_DIM),
-    )]));
+    // Header
+    lines.push(Line::from(vec![
+        Span::styled(
+            "  personal-assistant",
+            Style::default().fg(C_CYAN).add_modifier(Modifier::BOLD),
+        ),
+        Span::raw("        "),
+        Span::styled(&app.model_desc, Style::default().fg(C_MUTED)),
+        Span::styled(
+            "  ●",
+            Style::default().fg(if app.agent_running { C_CYAN } else { C_DIM }),
+        ),
+    ]));
     lines.push(Line::from(""));
 
+    // Messages
     for msg in &app.messages {
         render_message(msg, &mut lines, area.width.saturating_sub(4));
     }
 
     let total = lines.len().saturating_sub(1);
-    let max_scroll = total.saturating_sub(body_area.height.saturating_sub(1) as usize);
+    let vis = body_area.height.saturating_sub(1) as usize;
+    let max_scroll = total.saturating_sub(vis);
     let off = app.scroll_offset.min(max_scroll);
-    let history = Paragraph::new(lines)
-        .wrap(Wrap { trim: false })
-        .scroll((off as u16, 0));
-    f.render_widget(history, body_area);
+    f.render_widget(
+        Paragraph::new(lines)
+            .wrap(Wrap { trim: false })
+            .scroll((off as u16, 0)),
+        body_area,
+    );
 
-    // ── Separator + input ──
-    let input_text = if app.agent_running {
-        "  ⏳ waiting…".to_string()
+    // ── Separator 1 ──
+    f.render_widget(
+        Paragraph::new(Line::from(vec![Span::styled(
+            sep.clone(),
+            Style::default().fg(C_DIM),
+        )])),
+        sep1_area,
+    );
+
+    // ── Input ──
+    let prompt = if app.agent_running {
+        "❯ ⏳ waiting…".to_string()
+    } else if app.input.is_empty() {
+        "❯ ".to_string()
     } else {
         let c = app.cursor.min(app.input.len());
-        format!(
-            "❯ {}{}│{}",
-            &app.input[..c],
-            if app.input.is_empty() { "" } else { "" },
-            &app.input[c..]
-        )
+        format!("❯ {}{}│{}", &app.input[..c], "", &app.input[c..])
     };
     f.render_widget(
-        Paragraph::new(vec![
-            Line::from(vec![Span::styled(
-                "─".repeat(max_w),
-                Style::default().fg(C_DIM),
-            )]),
-            Line::from(vec![Span::styled(
-                input_text,
-                Style::default().fg(C_PRIMARY).add_modifier(Modifier::BOLD),
-            )]),
-        ]),
+        Paragraph::new(Line::from(vec![Span::styled(
+            prompt,
+            Style::default().fg(C_WHITE),
+        )])),
         input_area,
     );
 
-    // ── Footer ──
-    let footer = format!("  ? help  esc quit  pgup/pgdn scroll");
+    // ── Separator 2 ──
     f.render_widget(
         Paragraph::new(Line::from(vec![Span::styled(
-            footer,
+            sep,
             Style::default().fg(C_DIM),
         )])),
+        sep2_area,
+    );
+
+    // ── Footer ──
+    let left = "  enter send  esc quit  pgup/pgdn scroll";
+    let right = if app.agent_running { "⏳" } else { "◈" };
+    let padding = w.saturating_sub(left.len() + right.len() + 4);
+    f.render_widget(
+        Paragraph::new(Line::from(vec![
+            Span::styled(left, Style::default().fg(C_DIM)),
+            Span::styled(" ".repeat(padding), Style::default().fg(C_DIM)),
+            Span::styled(right, Style::default().fg(C_DIM)),
+        ])),
         footer_area,
     );
 }
@@ -103,8 +120,8 @@ fn render_message(msg: &super::app::Message, lines: &mut Vec<Line>, wrap_w: u16)
     match &msg.role {
         MessageRole::User => {
             lines.push(Line::from(vec![Span::styled(
-                "you",
-                Style::default().fg(C_PRIMARY).add_modifier(Modifier::BOLD),
+                "  you",
+                Style::default().fg(C_CYAN).add_modifier(Modifier::BOLD),
             )]));
         }
         MessageRole::Assistant { agent, model_short } => {
@@ -114,8 +131,8 @@ fn render_message(msg: &super::app::Message, lines: &mut Vec<Line>, wrap_w: u16)
                 format!("{} · {}", agent, model_short)
             };
             lines.push(Line::from(vec![Span::styled(
-                label,
-                Style::default().fg(C_ACCENT).add_modifier(Modifier::BOLD),
+                format!("  {}", label),
+                Style::default().fg(C_GREEN).add_modifier(Modifier::BOLD),
             )]));
         }
     }
@@ -128,11 +145,10 @@ fn render_message(msg: &super::app::Message, lines: &mut Vec<Line>, wrap_w: u16)
                     continue;
                 }
                 for line_text in text.lines() {
-                    let wrapped = textwrap::wrap(line_text, wrap_w as usize);
-                    for wline in wrapped {
+                    for wline in textwrap::wrap(line_text, wrap_w as usize) {
                         lines.push(Line::from(vec![
                             Span::raw("  "),
-                            Span::styled(wline.into_owned(), Style::default().fg(C_TEXT)),
+                            Span::styled(wline.into_owned(), Style::default().fg(C_WHITE)),
                         ]));
                     }
                 }
@@ -146,7 +162,7 @@ fn render_message(msg: &super::app::Message, lines: &mut Vec<Line>, wrap_w: u16)
             }
             Part::System { text } => {
                 lines.push(Line::from(vec![Span::styled(
-                    format!("  {}", text),
+                    format!("  ⎿  {}", text),
                     Style::default().fg(C_MUTED),
                 )]));
             }
@@ -156,23 +172,23 @@ fn render_message(msg: &super::app::Message, lines: &mut Vec<Line>, wrap_w: u16)
 }
 
 fn render_tool_block(lines: &mut Vec<Line>, name: &str, success: bool, result: &str, width: u16) {
-    let color = if success { C_SUCCESS } else { C_ERROR };
+    let c = if success { C_GREEN } else { C_RED };
     let icon = if success { "✓" } else { "✗" };
     lines.push(Line::from(vec![
         Span::raw("  "),
         Span::styled(
             format!("┌ {icon} {name}"),
-            Style::default().fg(color).add_modifier(Modifier::BOLD),
+            Style::default().fg(c).add_modifier(Modifier::BOLD),
         ),
     ]));
     if !result.is_empty() {
-        let trimmed = result.trim().to_string();
-        let w = width.saturating_sub(4) as usize;
-        if trimmed.len() <= w {
+        let t = result.trim().to_string();
+        let mw = width.saturating_sub(4) as usize;
+        if t.len() <= mw {
             lines.push(Line::from(vec![
                 Span::raw("  "),
                 Span::styled("│ ", Style::default().fg(C_BORDER)),
-                Span::styled(trimmed, Style::default().fg(C_MUTED).bg(C_TOOL_BG)),
+                Span::styled(t, Style::default().fg(C_MUTED).bg(C_TOOL_BG)),
             ]));
         }
     }
@@ -190,18 +206,6 @@ mod tests {
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
 
-    fn buffer_contains(buffer: &ratatui::buffer::Buffer, needle: &str) -> bool {
-        for y in 0..buffer.area.height {
-            let row: String = (0..buffer.area.width)
-                .map(|x| buffer[(x, y)].symbol())
-                .collect();
-            if row.contains(needle) {
-                return true;
-            }
-        }
-        false
-    }
-
     #[test]
     fn renders_user_and_agent() {
         let mut app = TuiApp::new("deepseek-chat".into());
@@ -213,7 +217,11 @@ mod tests {
         let mut terminal = Terminal::new(backend).unwrap();
         terminal.draw(|f| render(f, &app)).unwrap();
         let buf = terminal.backend().buffer();
-        assert!(buffer_contains(buf, "hello"));
-        assert!(buffer_contains(buf, "hi there"));
+        let rows: Vec<String> = (0..buf.area.height)
+            .map(|y| (0..buf.area.width).map(|x| buf[(x, y)].symbol()).collect())
+            .collect();
+        let all = rows.join("\n");
+        assert!(all.contains("hello"));
+        assert!(all.contains("hi there"));
     }
 }
