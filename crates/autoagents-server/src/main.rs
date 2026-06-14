@@ -140,6 +140,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 /// Interactive REPL mode — no server, just stdin/stdout chat.
 async fn run_repl() -> Result<(), Box<dyn std::error::Error>> {
+    // Minimal logger so `log::warn!` from the supervisor / experts is
+    // visible on stderr without spamming the REPL prompt on stdout.
+    let _ = env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("warn"))
+        .try_init();
+
     let config_path = std::env::var("ASSISTANT_CONFIG")
         .unwrap_or_else(|_| "/opt/personal-assistant/config.yaml".to_string());
 
