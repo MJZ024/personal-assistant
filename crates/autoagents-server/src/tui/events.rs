@@ -57,6 +57,7 @@ pub async fn event_loop(
 
             // ── Agent progress (tool calls per turn) ──
             Some(tool_names) = progress_rx.recv() => {
+                if app.follow_bottom { app.scroll_offset = 0; }
                 for name in tool_names.split(", ") {
                     if !name.is_empty() && name != "thinking…" {
                         if let Some(msg) = app.last_assistant_mut() {
@@ -126,6 +127,13 @@ async fn handle_event(
                     KeyCode::End => {
                         app.cursor_end();
                     }
+                    KeyCode::PageUp => {
+                        app.follow_bottom = false;
+                        app.scroll_offset = app.scroll_offset.saturating_add(10);
+                    }
+                    KeyCode::PageDown => {
+                        app.scroll_offset = app.scroll_offset.saturating_sub(10);
+                    }
                     _ => {}
                 }
             }
@@ -169,6 +177,8 @@ async fn handle_enter(
                 // New task → spawn agent in background
                 app.status = format!("{} | {} agent running…", app.model_desc, ttype);
                 app.agent_running = true;
+                app.follow_bottom = true;
+                app.scroll_offset = 0;
                 app.begin_assistant(&ttype);
 
                 let llm_clone = Arc::clone(llm);

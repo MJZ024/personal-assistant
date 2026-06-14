@@ -76,6 +76,10 @@ pub struct TuiApp {
     pub agent_running: bool,
     pub model_desc: String,
     pub needs_resize: bool,
+    /// Scroll offset for the message area (in lines).
+    pub scroll_offset: usize,
+    /// Whether to auto-scroll to bottom on new content (PageUp disengages).
+    pub follow_bottom: bool,
 }
 
 impl TuiApp {
@@ -88,6 +92,8 @@ impl TuiApp {
             agent_running: false,
             model_desc,
             needs_resize: false,
+            scroll_offset: 0,
+            follow_bottom: true,
         }
     }
 

@@ -50,7 +50,12 @@ pub fn render(f: &mut Frame, app: &TuiApp) {
         )]),
     );
 
-    let history = Paragraph::new(lines).wrap(Wrap { trim: false });
+    let total_lines = lines.len().saturating_sub(1);
+    let max_scroll = total_lines.saturating_sub(messages_area.height.saturating_sub(1) as usize);
+    let offset = app.scroll_offset.min(max_scroll);
+    let history = Paragraph::new(lines)
+        .wrap(Wrap { trim: false })
+        .scroll((offset as u16, 0));
     f.render_widget(history, messages_area);
 
     // ── Input area ──

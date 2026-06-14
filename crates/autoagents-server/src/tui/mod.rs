@@ -91,6 +91,9 @@ pub async fn run_tui(app_config: AppConfig, auth: Arc<ToolAuthInterceptor>) {
         }
     };
 
+    // ── Clear any residual content ──
+    let _ = terminal.clear();
+
     // ── Run ──
     let app = app::TuiApp::new(model_desc);
     let result = events::event_loop(&mut terminal, app, supervisor, llm, expert_ctx).await;
