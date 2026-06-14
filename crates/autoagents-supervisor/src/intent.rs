@@ -134,7 +134,6 @@ fn detect_task_type(message: &str) -> String {
         "函数",
         "debug",
         "编译",
-        "运行",
         "开发",
         "重构",
         "git",
@@ -152,6 +151,9 @@ fn detect_task_type(message: &str) -> String {
         "function",
         "implement",
         "fix",
+        // File/directory inspection (shell-driven → coding agent)
+        "列出",
+        "目录",
     ];
     for kw in &coding_kw {
         if msg.contains(kw) {
@@ -191,6 +193,11 @@ fn detect_task_type(message: &str) -> String {
         "monitor",
         "restart",
         "disk",
+        // Read-only investigation / status queries
+        "查看",
+        "显示",
+        "状态",
+        "系统",
     ];
     for kw in &ops_kw {
         if msg.contains(kw) {
@@ -206,7 +213,6 @@ fn detect_task_type(message: &str) -> String {
         "excel",
         "ppt",
         "表格",
-        "文件",
         "翻译",
         "摘要",
         "总结",
@@ -369,6 +375,59 @@ mod tests {
         match intent {
             Intent::NewTask { priority, .. } => assert_eq!(priority, 1),
             _ => panic!("Expected NewTask with normal priority"),
+        }
+    }
+
+    // ── Regression: file operations are coding/ops, not document ──
+
+    #[test]
+    fn file_operations_are_not_document() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        for msg in [
+            "列出当前目录文件",
+            "看看这个目录里有什么文件",
+            "显示 /tmp 下的文件列表",
+        ] {
+            let intent = rt.block_on(IntentClassifier::classify(msg, None)).unwrap();
+            match &intent {
+                Intent::NewTask { task_type, .. } => {
+                    assert_ne!(
+                        task_type, "document",
+                        "file operation '{msg}' must not be classified as document"
+                    );
+                }
+                other => panic!("expected NewTask for '{msg}', got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn status_queries_are_ops_investigation() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        for msg in ["查看系统状态", "显示 CPU 使用率", "系统运行情况"] {
+            let intent = rt.block_on(IntentClassifier::classify(msg, None)).unwrap();
+            match &intent {
+                Intent::NewTask { task_type, .. } => {
+                    assert_eq!(
+                        task_type, "ops",
+                        "status query '{msg}' should be ops, got '{task_type}'"
+                    );
+                }
+                other => panic!("expected NewTask(ops) for '{msg}', got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn dedicated_coding_tasks_still_coding() {
+        // Regression guard: existing routing must not break.
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let intent = rt
+            .block_on(IntentClassifier::classify("帮我写个Python脚本", None))
+            .unwrap();
+        match intent {
+            Intent::NewTask { task_type, .. } => assert_eq!(task_type, "coding"),
+            other => panic!("Expected coding, got {other:?}"),
         }
     }
 }
