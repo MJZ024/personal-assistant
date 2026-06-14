@@ -17,7 +17,7 @@ const C_RED: Color = Color::Red;
 const C_BORDER: Color = Color::DarkGray;
 const C_TOOL_BG: Color = Color::Rgb(30, 30, 40);
 
-pub fn render(f: &mut Frame, app: &TuiApp) {
+pub fn render(f: &mut Frame, app: &mut TuiApp) {
     let area = f.area();
     let w = area.width as usize;
     let sep = "─".repeat(w.saturating_sub(2));
@@ -50,7 +50,14 @@ pub fn render(f: &mut Frame, app: &TuiApp) {
     let total = lines.len().saturating_sub(1);
     let vis = body_area.height.saturating_sub(1) as usize;
     let max_scroll = total.saturating_sub(vis);
-    let off = app.scroll_offset.min(max_scroll);
+    // Auto-follow bottom: override manual offset when follow_bottom is set.
+    // Also sync the stored offset so PageUp/PageDown work from the right place.
+    let off = if app.follow_bottom {
+        app.scroll_offset = max_scroll;
+        max_scroll
+    } else {
+        app.scroll_offset.min(max_scroll)
+    };
     f.render_widget(
         Paragraph::new(lines)
             .wrap(Wrap { trim: false })

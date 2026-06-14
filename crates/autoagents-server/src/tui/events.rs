@@ -57,7 +57,6 @@ pub async fn event_loop(
 
             // ── Agent progress (tool calls per turn: "name|ok/err|snippet") ──
             Some(raw) = progress_rx.recv() => {
-                if app.follow_bottom { app.scroll_offset = 0; }
                 let mut parts = raw.splitn(3, '|');
                 let name = parts.next().unwrap_or("");
                 let ok = parts.next().unwrap_or("ok") != "err";
@@ -71,7 +70,7 @@ pub async fn event_loop(
 
             // ── Render tick ──
             _ = tick.tick() => {
-                terminal.draw(|f| super::ui::render(f, &app))?;
+                terminal.draw(|f| super::ui::render(f, &mut app))?;
             }
         }
     }
@@ -180,7 +179,6 @@ async fn handle_enter(
                 app.status = format!("{} | {} agent running…", app.model_desc, ttype);
                 app.agent_running = true;
                 app.follow_bottom = true;
-                app.scroll_offset = 0;
                 app.begin_assistant(&ttype);
 
                 let llm_clone = Arc::clone(llm);
