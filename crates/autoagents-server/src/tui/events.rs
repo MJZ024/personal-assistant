@@ -24,9 +24,11 @@ pub async fn event_loop(
     let mut reader = EventStream::new();
     let mut tick = tokio::time::interval(Duration::from_millis(50));
 
-    // Channel: agent task → TUI (sends the final result string)
+    // Channel: agent task → TUI (sends final result)
     let (result_tx, mut result_rx) = mpsc::channel::<String>(4);
-
+    // Channel: agent progress → TUI (tool names per turn, unbounded to
+    // avoid backpressure blocking the agent loop)
+    let (progress_tx, mut progress_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
     loop {
         tokio::select! {
             // ── crossterm events ──
@@ -34,7 +36,7 @@ pub async fn event_loop(
                 match maybe_event {
                     Some(Ok(event)) => {
                         if handle_event(event, &mut app, &supervisor,
-                                       &llm, &expert_ctx, &result_tx).await? {
+                                       &llm, &expert_ctx, &progress_tx, &result_tx).await? {
                             break; // /quit or Ctrl+D
                         }
                     }
@@ -43,10 +45,19 @@ pub async fn event_loop(
             }
 
             // ── Agent result ──
-            Some(msg) = result_rx.recv() => {
-                app.push_agent(msg);
+            Some(text) = result_rx.recv() => {
+                app.push_agent(text);
                 app.agent_running = false;
                 app.status = format!("{} | idle", app.model_desc);
+            }
+
+            // ── Agent progress (tool calls per turn) ──
+            Some(tool_names) = progress_rx.recv() => {
+                for name in tool_names.split(", ") {
+                    if !name.is_empty() && name != "thinking…" {
+                        app.push_tool(name, true, "");
+                    }
+                }
             }
 
             // ── Render tick ──
@@ -66,6 +77,7 @@ async fn handle_event(
     supervisor: &Arc<tokio::sync::Mutex<Supervisor>>,
     llm: &Arc<dyn autoagents_llm::LLMProvider>,
     expert_ctx: &Arc<autoagents_experts::ExpertContext>,
+    progress_tx: &tokio::sync::mpsc::UnboundedSender<String>,
     result_tx: &mpsc::Sender<String>,
 ) -> Result<bool, Box<dyn std::error::Error>> {
     match event {
@@ -80,7 +92,8 @@ async fn handle_event(
             }
 
             if key.code == KeyCode::Enter {
-                return handle_enter(app, supervisor, llm, expert_ctx, result_tx).await;
+                return handle_enter(app, supervisor, llm, expert_ctx, progress_tx, result_tx)
+                    .await;
             }
 
             // Text input (only when agent is not running)
@@ -125,6 +138,7 @@ async fn handle_enter(
     supervisor: &Arc<tokio::sync::Mutex<Supervisor>>,
     llm: &Arc<dyn autoagents_llm::LLMProvider>,
     expert_ctx: &Arc<autoagents_experts::ExpertContext>,
+    progress_tx: &tokio::sync::mpsc::UnboundedSender<String>,
     result_tx: &mpsc::Sender<String>,
 ) -> Result<bool, Box<dyn std::error::Error>> {
     let text = app.submit_input();
@@ -154,20 +168,22 @@ async fn handle_enter(
                 let llm_clone = Arc::clone(llm);
                 let ctx_clone = Arc::clone(expert_ctx);
                 let tx = result_tx.clone();
+                let ptx = progress_tx.clone();
                 let ttype_owned = ttype.to_string();
                 let desc_owned = desc.to_string();
 
                 tokio::spawn(async move {
-                    let outcome = crate::runner::run_expert_sync(
+                    let outcome = crate::runner::run_expert_with_progress(
                         &ttype_owned,
                         &desc_owned,
                         llm_clone,
                         ctx_clone,
+                        ptx,
                     )
                     .await;
                     let _ = tx
                         .send(match outcome {
-                            Ok(r) => r,
+                            Ok(text) => text,
                             Err(e) => format!("Agent error: {e}"),
                         })
                         .await;

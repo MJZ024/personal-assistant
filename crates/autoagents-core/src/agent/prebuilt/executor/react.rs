@@ -146,6 +146,11 @@ impl From<TurnEngineError> for ReActExecutorError {
 pub struct ReActAgent<T: AgentDeriveT> {
     inner: Arc<T>,
     max_turns: usize,
+    /// Optional channel to report per-turn progress (tool name per turn).
+    /// When set, each turn pushes a tool name through this sender in
+    /// addition to the stderr log. Used by the TUI for live tool-call display.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub(crate) progress_tx: Option<tokio::sync::mpsc::UnboundedSender<String>>,
 }
 
 impl<T: AgentDeriveT> Clone for ReActAgent<T> {
@@ -153,6 +158,8 @@ impl<T: AgentDeriveT> Clone for ReActAgent<T> {
         Self {
             inner: Arc::clone(&self.inner),
             max_turns: self.max_turns,
+            #[cfg(not(target_arch = "wasm32"))]
+            progress_tx: self.progress_tx.clone(),
         }
     }
 }
@@ -162,6 +169,8 @@ impl<T: AgentDeriveT> ReActAgent<T> {
         Self {
             inner: Arc::new(inner),
             max_turns: 10,
+            #[cfg(not(target_arch = "wasm32"))]
+            progress_tx: None,
         }
     }
 
@@ -169,7 +178,16 @@ impl<T: AgentDeriveT> ReActAgent<T> {
         Self {
             inner: Arc::new(inner),
             max_turns: max_turns.max(1),
+            #[cfg(not(target_arch = "wasm32"))]
+            progress_tx: None,
         }
+    }
+
+    /// Attach a progress channel. When set, each turn's tool name is sent
+    /// through this sender so a TUI can display live tool-call progress.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn set_progress_tx(&mut self, tx: tokio::sync::mpsc::UnboundedSender<String>) {
+        self.progress_tx = Some(tx);
     }
 }
 
@@ -321,6 +339,12 @@ impl<T: AgentDeriveT + AgentHooks> AgentExecutor for ReActAgent<T> {
                     } else {
                         names.join(", ")
                     };
+                    // Push tool name through progress channel (TUI), ignore
+                    // disconnects quietly.
+                    #[cfg(not(target_arch = "wasm32"))]
+                    if let Some(ref tx) = self.progress_tx {
+                        let _ = tx.send(recent_tools.clone());
+                    }
                     eprintln!("  [{}/{}] {}", turn_index + 1, max_turns, recent_tools);
 
                     accumulated_tool_calls.extend(output.tool_calls);

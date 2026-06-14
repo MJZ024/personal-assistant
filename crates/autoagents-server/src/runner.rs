@@ -57,7 +57,8 @@ pub fn make_expert_context(
 /// within the platform's deadline.
 pub fn spawn_expert(req: RunRequest, on_complete: impl FnOnce(RunOutcome) + Send + 'static) {
     tokio::spawn(async move {
-        let outcome = run_expert(&req.task_type, &req.description, req.llm, req.context).await;
+        let outcome =
+            run_expert(&req.task_type, &req.description, req.llm, req.context, None).await;
         let outcome = match outcome {
             Ok(response) => RunOutcome {
                 task_id: req.task_id,
@@ -84,22 +85,39 @@ pub async fn run_expert_sync(
     llm: Arc<dyn LLMProvider>,
     context: Arc<ExpertContext>,
 ) -> Result<String, RunnerError> {
-    run_expert(task_type, description, llm, context).await
+    run_expert(task_type, description, llm, context, None).await
 }
 
-// ── internal dispatch ──
-
-async fn run_expert(
+/// Run an expert agent with optional per-turn progress via an unbounded
+/// channel. The TUI passes a sender to display tool calls live; the REPL
+/// passes None.
+pub(crate) async fn run_expert_with_progress(
     task_type: &str,
     description: &str,
     llm: Arc<dyn LLMProvider>,
     context: Arc<ExpertContext>,
+    progress_tx: tokio::sync::mpsc::UnboundedSender<String>,
+) -> Result<String, RunnerError> {
+    run_expert(task_type, description, llm, context, Some(progress_tx)).await
+}
+
+// ── internal dispatch ──
+
+pub(crate) async fn run_expert(
+    task_type: &str,
+    description: &str,
+    llm: Arc<dyn LLMProvider>,
+    context: Arc<ExpertContext>,
+    progress_tx: Option<tokio::sync::mpsc::UnboundedSender<String>>,
 ) -> Result<String, RunnerError> {
     match task_type {
         "coding" => {
             let mut agent = CodingAgent::new();
             agent.init(context).await;
-            let react = ReActAgent::new(agent);
+            let mut react = ReActAgent::new(agent);
+            if let Some(tx) = progress_tx {
+                react.set_progress_tx(tx);
+            }
             let handle = AgentBuilder::<_, DirectAgent>::new(react)
                 .llm(llm)
                 .build()
@@ -115,7 +133,10 @@ async fn run_expert(
         "ops" => {
             let mut agent = OpsAgent::new();
             agent.init(context).await;
-            let react = ReActAgent::new(agent);
+            let mut react = ReActAgent::new(agent);
+            if let Some(tx) = progress_tx {
+                react.set_progress_tx(tx);
+            }
             let handle = AgentBuilder::<_, DirectAgent>::new(react)
                 .llm(llm)
                 .build()
@@ -136,7 +157,10 @@ async fn run_expert(
             eprintln!("(unknown agent type '{unknown}', falling back to coding)");
             let mut agent = CodingAgent::new();
             agent.init(context).await;
-            let react = ReActAgent::new(agent);
+            let mut react = ReActAgent::new(agent);
+            if let Some(tx) = progress_tx {
+                react.set_progress_tx(tx);
+            }
             let handle = AgentBuilder::<_, DirectAgent>::new(react)
                 .llm(llm)
                 .build()

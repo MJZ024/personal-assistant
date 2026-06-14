@@ -95,6 +95,28 @@ fn render_message(msg: &Message) -> Line<'static> {
             ),
             Span::raw(text.clone()),
         ]),
+        Message::Tool {
+            tool_name,
+            success,
+            result_summary,
+        } => {
+            let icon = if *success { "✓" } else { "✗" };
+            let color = if *success { Color::Green } else { Color::Red };
+            Line::from(vec![
+                Span::styled(
+                    format!("  {icon} {tool_name}"),
+                    Style::default().fg(color).add_modifier(Modifier::BOLD),
+                ),
+                if !result_summary.is_empty() {
+                    Span::styled(
+                        format!(" → {result_summary}"),
+                        Style::default().fg(Color::DarkGray),
+                    )
+                } else {
+                    Span::raw("")
+                },
+            ])
+        }
         Message::System { text } => Line::from(vec![
             Span::styled("  [··] ", Style::default().fg(Color::DarkGray)),
             Span::styled(text.clone(), Style::default().fg(Color::DarkGray)),

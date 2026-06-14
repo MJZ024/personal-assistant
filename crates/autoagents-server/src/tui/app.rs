@@ -7,6 +7,12 @@ pub enum Message {
     User { text: String },
     /// A completed response from the assistant.
     Agent { text: String },
+    /// A tool call result (inline in the conversation).
+    Tool {
+        tool_name: String,
+        success: bool,
+        result_summary: String,
+    },
     /// A system notification (errors, info, etc.).
     System { text: String },
 }
@@ -64,6 +70,15 @@ impl TuiApp {
     /// Push an agent response.
     pub fn push_agent(&mut self, text: String) {
         self.messages.push(Message::Agent { text });
+    }
+
+    /// Push a tool call result.
+    pub fn push_tool(&mut self, tool_name: &str, success: bool, result_summary: &str) {
+        self.messages.push(Message::Tool {
+            tool_name: tool_name.to_string(),
+            success,
+            result_summary: result_summary.to_string(),
+        });
     }
 
     /// Handle a character being typed.
