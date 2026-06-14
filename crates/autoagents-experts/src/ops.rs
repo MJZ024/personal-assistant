@@ -7,9 +7,53 @@ use autoagents_core::agent::{AgentDeriveT, AgentHooks};
 use autoagents_core::tool::{ToolCallError, ToolRuntime, ToolT};
 
 use autoagents_tool_auth::PermissionLevel;
+use std::time::Duration;
 
 use super::ExpertAgent;
 use super::redact::redact_secrets;
+
+// ── Cross-platform command helpers ──
+// These exist so the ops agent works on macOS dev machines as well as
+// the production Linux server.  Windows is not supported — the project
+// assumes a POSIX userland with df / ps / top / crontab / tail.
+
+/// Run a command with a 30 s hard timeout so a misbehaving command
+/// (e.g. macOS `top` without `-b`) cannot hang the agent.
+async fn timed_output(
+    cmd: &mut tokio::process::Command,
+) -> Result<std::process::Output, ToolCallError> {
+    tokio::time::timeout(Duration::from_secs(30), cmd.output())
+        .await
+        .map_err(|_| ToolCallError::RuntimeError("command timed out (30 s)".into()))?
+        .map_err(|e| ToolCallError::RuntimeError(e.to_string().into()))
+}
+
+fn ps_args() -> Vec<&'static str> {
+    if cfg!(target_os = "linux") {
+        vec![
+            "--no-headers",
+            "-eo",
+            "pid,user,%cpu,%mem,comm",
+            "--sort=-%cpu",
+        ]
+    } else {
+        // macOS: no --no-headers, use -r for reverse sort by CPU
+        vec!["-eo", "pid,user,%cpu,%mem,comm", "-r"]
+    }
+}
+
+fn top_args() -> Vec<&'static str> {
+    if cfg!(target_os = "linux") {
+        vec!["-bn1"]
+    } else {
+        // macOS: one sample, no memory order flag
+        vec!["-l", "1", "-n", "0"]
+    }
+}
+
+fn has_procfs() -> bool {
+    cfg!(target_os = "linux")
+}
 
 // ── Agent Definition ──
 
@@ -107,11 +151,8 @@ impl ToolRuntime for SystemStatusTool {
             .unwrap_or(false);
         let mut result = serde_json::json!({});
 
-        // CPU / Memory summary
-        if let Ok(output) = tokio::process::Command::new("top")
-            .args(["-bn1"])
-            .output()
-            .await
+        // CPU / Memory summary (OS-aware top args + timeout)
+        if let Ok(output) = timed_output(tokio::process::Command::new("top").args(top_args())).await
         {
             let stdout = String::from_utf8_lossy(&output.stdout);
             result["top_summary"] =
@@ -119,32 +160,51 @@ impl ToolRuntime for SystemStatusTool {
         }
 
         // Disk
-        if let Ok(output) = tokio::process::Command::new("df")
-            .args(["-h", "/"])
-            .output()
-            .await
+        if let Ok(output) = timed_output(tokio::process::Command::new("df").args(["-h", "/"])).await
         {
             result["disk_root"] =
                 serde_json::Value::String(String::from_utf8_lossy(&output.stdout).to_string());
         }
 
-        // Load average
-        if let Ok(load) = tokio::fs::read_to_string("/proc/loadavg").await {
-            result["load_average"] = serde_json::Value::String(load.trim().to_string());
+        // Load average (Linux procfs; macOS uses sysctl)
+        if has_procfs() {
+            if let Ok(load) = tokio::fs::read_to_string("/proc/loadavg").await {
+                result["load_average"] = serde_json::Value::String(load.trim().to_string());
+            }
+        } else {
+            if let Ok(output) =
+                timed_output(tokio::process::Command::new("sysctl").args(["-n", "vm.loadavg"]))
+                    .await
+            {
+                result["load_average"] =
+                    serde_json::Value::String(String::from_utf8_lossy(&output.stdout).to_string());
+            }
         }
 
-        // Memory
-        if let Ok(meminfo) = tokio::fs::read_to_string("/proc/meminfo").await {
-            result["memory"] =
-                serde_json::Value::String(meminfo.lines().take(3).collect::<Vec<_>>().join("\n"));
+        // Memory (Linux procfs; macOS vm_stat + sysctl)
+        if has_procfs() {
+            if let Ok(meminfo) = tokio::fs::read_to_string("/proc/meminfo").await {
+                result["memory"] = serde_json::Value::String(
+                    meminfo.lines().take(3).collect::<Vec<_>>().join("\n"),
+                );
+            }
+        } else {
+            if let Ok(output) = timed_output(
+                tokio::process::Command::new("sh")
+                    .arg("-c")
+                    .arg("vm_stat; echo '---'; sysctl hw.memsize"),
+            )
+            .await
+            {
+                result["memory"] =
+                    serde_json::Value::String(String::from_utf8_lossy(&output.stdout).to_string());
+            }
         }
 
-        // Processes
+        // Processes (OS-aware ps args + timeout)
         if include_procs {
-            if let Ok(output) = tokio::process::Command::new("ps")
-                .args(["--no-headers", "-eo", "pid,comm,%cpu,%mem", "--sort=-%cpu"])
-                .output()
-                .await
+            if let Ok(output) =
+                timed_output(tokio::process::Command::new("ps").args(ps_args())).await
             {
                 let stdout = String::from_utf8_lossy(&output.stdout);
                 result["top_processes"] = serde_json::Value::String(
@@ -231,12 +291,12 @@ impl ToolRuntime for ServiceControlTool {
             );
         }
 
-        let output = tokio::process::Command::new("systemctl")
-            .arg(action)
-            .arg(service)
-            .output()
-            .await
-            .map_err(|e| ToolCallError::RuntimeError(e.to_string().into()))?;
+        let output = timed_output(
+            tokio::process::Command::new("systemctl")
+                .arg(action)
+                .arg(service),
+        )
+        .await?;
 
         Ok(serde_json::json!({
             "action": action, "service": service,
@@ -286,7 +346,7 @@ impl ToolRuntime for LogViewTool {
             if !service.is_empty() {
                 cmd.args(["-u", service]);
             }
-            cmd.output().await
+            timed_output(&mut cmd).await
         } else {
             // Confine log reads: block secret-bearing paths (config.yaml,
             // ~/.ssh, /etc/shadow, …) even though /var/log stays open.
@@ -299,14 +359,13 @@ impl ToolRuntime for LogViewTool {
                     ));
                 }
             };
-            tokio::process::Command::new("tail")
-                .args(["-n", &lines])
-                .arg(safe.as_os_str())
-                .output()
-                .await
-        };
-
-        let output = output.map_err(|e| ToolCallError::RuntimeError(e.to_string().into()))?;
+            timed_output(
+                tokio::process::Command::new("tail")
+                    .args(["-n", &lines])
+                    .arg(safe.as_os_str()),
+            )
+            .await
+        }?;
         let log_text = redact_secrets(&String::from_utf8_lossy(&output.stdout));
         Ok(serde_json::json!({ "log": log_text, "line_count": log_text.lines().count() }))
     }
@@ -351,11 +410,8 @@ impl ToolRuntime for CronTaskTool {
             .ok_or(ToolCallError::RuntimeError("action required".into()))?;
         match action {
             "list" => {
-                let output = tokio::process::Command::new("crontab")
-                    .arg("-l")
-                    .output()
-                    .await
-                    .map_err(|e| ToolCallError::RuntimeError(e.to_string().into()))?;
+                let output =
+                    timed_output(tokio::process::Command::new("crontab").arg("-l")).await?;
                 Ok(serde_json::json!({ "crontab": String::from_utf8_lossy(&output.stdout) }))
             }
             _ => Err(ToolCallError::RuntimeError(
@@ -406,16 +462,8 @@ impl ToolRuntime for ProcessManageTool {
             .ok_or(ToolCallError::RuntimeError("action required".into()))?;
         match action {
             "list" => {
-                let output = tokio::process::Command::new("ps")
-                    .args([
-                        "--no-headers",
-                        "-eo",
-                        "pid,user,%cpu,%mem,comm",
-                        "--sort=-%cpu",
-                    ])
-                    .output()
-                    .await
-                    .map_err(|e| ToolCallError::RuntimeError(e.to_string().into()))?;
+                let output =
+                    timed_output(tokio::process::Command::new("ps").args(ps_args())).await?;
 
                 let stdout = String::from_utf8_lossy(&output.stdout);
                 let procs: Vec<&str> = stdout.lines().take(20).collect();
@@ -456,11 +504,12 @@ impl ToolRuntime for ProcessManageTool {
                     "allowed",
                 );
 
-                let output = tokio::process::Command::new("kill")
-                    .args(["-s", signal, &pid.to_string()])
-                    .output()
-                    .await
-                    .map_err(|e| ToolCallError::RuntimeError(e.to_string().into()))?;
+                let output = timed_output(tokio::process::Command::new("kill").args([
+                    "-s",
+                    signal,
+                    &pid.to_string(),
+                ]))
+                .await?;
 
                 Ok(
                     serde_json::json!({ "pid": pid, "signal": signal, "success": output.status.success() }),
@@ -474,6 +523,41 @@ impl ToolRuntime for ProcessManageTool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── cross-platform command builders ──
+
+    #[test]
+    fn ps_args_contains_pid_and_cpu() {
+        let args = ps_args();
+        let joined = args.join(" ");
+        assert!(joined.contains("pid"), "missing pid column");
+        assert!(joined.contains("%cpu"), "missing %cpu column");
+    }
+
+    #[test]
+    fn top_args_differs_by_os() {
+        let args = top_args();
+        if cfg!(target_os = "linux") {
+            assert!(
+                args.iter().any(|a| a == &"-bn1"),
+                "linux top needs -b (batch)"
+            );
+        } else {
+            assert!(
+                args.iter().any(|a| a == &"-l"),
+                "macOS top needs -l (samples)"
+            );
+        }
+    }
+
+    #[test]
+    fn has_procfs_matches_os() {
+        if cfg!(target_os = "linux") {
+            assert!(has_procfs());
+        } else {
+            assert!(!has_procfs());
+        }
+    }
 
     #[tokio::test]
     async fn process_kill_fails_closed_without_auth() {

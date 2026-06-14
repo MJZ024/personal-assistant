@@ -176,12 +176,16 @@ impl ToolRuntime for ShellExecuteTool {
         let argv = resolve_argv(self.sandbox, &workdir, home.as_deref(), command)
             .map_err(|e| ToolCallError::RuntimeError(e.into()))?;
 
-        let output = tokio::process::Command::new(&argv[0])
-            .args(&argv[1..])
-            .current_dir(&workdir)
-            .output()
-            .await
-            .map_err(|e| ToolCallError::RuntimeError(e.to_string().into()))?;
+        let output = tokio::time::timeout(
+            std::time::Duration::from_secs(60),
+            tokio::process::Command::new(&argv[0])
+                .args(&argv[1..])
+                .current_dir(&workdir)
+                .output(),
+        )
+        .await
+        .map_err(|_| ToolCallError::RuntimeError("command timed out (60 s)".into()))?
+        .map_err(|e| ToolCallError::RuntimeError(e.to_string().into()))?;
 
         Ok(serde_json::json!({
             "stdout": redact_secrets(&String::from_utf8_lossy(&output.stdout)),
