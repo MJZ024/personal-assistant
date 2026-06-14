@@ -137,11 +137,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 /// manual env-var setup.  Does nothing on a production server where
 /// `~/.claude/settings.json` is absent.
 fn load_dev_api_keys() {
-    let Some(home) = std::env::var_os("HOME") else { return };
+    let Some(home) = std::env::var_os("HOME") else {
+        return;
+    };
     let path = std::path::PathBuf::from(home)
         .join(".claude")
         .join("settings.json");
-    let Ok(content) = std::fs::read_to_string(path) else { return };
+    let Ok(content) = std::fs::read_to_string(path) else {
+        return;
+    };
     let Ok(config) = serde_json::from_str::<serde_json::Value>(&content) else {
         return;
     };
