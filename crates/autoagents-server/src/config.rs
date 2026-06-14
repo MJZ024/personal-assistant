@@ -110,7 +110,7 @@ impl Default for ModelConfig {
                     },
                     fallbacks: vec![ModelProvider {
                         provider: "deepseek".to_string(),
-                        model: "deepseek-coder".to_string(),
+                        model: "deepseek-chat".to_string(),
                         api_key_env: "DEEPSEEK_KEY".to_string(),
                         base_url: Some("https://api.deepseek.com".to_string()),
                     }],
