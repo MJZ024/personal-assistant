@@ -46,7 +46,11 @@ pub async fn event_loop(
 
             // ── Agent result ──
             Some(text) = result_rx.recv() => {
-                app.push_agent(text);
+                if let Some(msg) = app.last_assistant_mut() {
+                    if !text.is_empty() {
+                        msg.push_text(&text);
+                    }
+                }
                 app.agent_running = false;
                 app.status = format!("{} | idle", app.model_desc);
             }
@@ -55,7 +59,9 @@ pub async fn event_loop(
             Some(tool_names) = progress_rx.recv() => {
                 for name in tool_names.split(", ") {
                     if !name.is_empty() && name != "thinking…" {
-                        app.push_tool(name, true, "");
+                        if let Some(msg) = app.last_assistant_mut() {
+                            msg.push_tool(name, true, "");
+                        }
                     }
                 }
             }
@@ -163,7 +169,7 @@ async fn handle_enter(
                 // New task → spawn agent in background
                 app.status = format!("{} | {} agent running…", app.model_desc, ttype);
                 app.agent_running = true;
-                app.push_system(&format!("dispatching to {ttype} agent: {desc}"));
+                app.begin_assistant(&ttype);
 
                 let llm_clone = Arc::clone(llm);
                 let ctx_clone = Arc::clone(expert_ctx);
@@ -190,11 +196,20 @@ async fn handle_enter(
                 });
             } else {
                 // Direct response (Query/Command) → show immediately
-                app.push_agent(resp.message);
+                let mut msg = crate::tui::app::Message::assistant(
+                    "supervisor",
+                    &app.model_desc.split(" · ").last().unwrap_or("?"),
+                );
+                msg.push_text(&resp.message);
+                app.messages.push(msg);
             }
         }
         Err(e) => {
-            app.push_system(&format!("Error: {e}"));
+            let mut msg = crate::tui::app::Message::assistant("system", "error");
+            msg.parts.push(crate::tui::app::Part::System {
+                text: format!("Error: {e}"),
+            });
+            app.messages.push(msg);
         }
     }
 

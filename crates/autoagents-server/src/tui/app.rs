@@ -1,37 +1,80 @@
-//! Application state for the TUI.
+//! Application state for the TUI — inspired by ReOpenCode's transcript model.
 
-/// A chat message rendered in the conversation history.
+/// A part within a message (text, tool call, system notice).
 #[derive(Clone)]
-pub enum Message {
-    /// A message from the user.
-    User { text: String },
-    /// A completed response from the assistant.
-    Agent { text: String },
-    /// A tool call result (inline in the conversation).
+pub enum Part {
+    Text {
+        text: String,
+    },
     Tool {
         tool_name: String,
         success: bool,
-        result_summary: String,
+        result: String,
     },
-    /// A system notification (errors, info, etc.).
-    System { text: String },
+    System {
+        text: String,
+    },
 }
 
-/// Global application state shared between the event loop and the renderer.
+/// A single message in the conversation, modelled after ReOpenCode's
+/// `TranscriptMessage`: one role + a list of parts. Tool calls and text
+/// coexist in the same assistant message.
+#[derive(Clone)]
+pub struct Message {
+    pub role: MessageRole,
+    pub parts: Vec<Part>,
+}
+
+#[derive(Clone)]
+pub enum MessageRole {
+    User,
+    /// `agent` is "coding" / "ops"; `model_short` is the model name.
+    Assistant {
+        agent: String,
+        model_short: String,
+    },
+}
+
+impl Message {
+    pub fn user(text: &str) -> Self {
+        Self {
+            role: MessageRole::User,
+            parts: vec![Part::Text {
+                text: text.to_string(),
+            }],
+        }
+    }
+    pub fn assistant(agent: &str, model: &str) -> Self {
+        Self {
+            role: MessageRole::Assistant {
+                agent: agent.to_string(),
+                model_short: model.to_string(),
+            },
+            parts: Vec::new(),
+        }
+    }
+    pub fn push_text(&mut self, text: &str) {
+        self.parts.push(Part::Text {
+            text: text.to_string(),
+        });
+    }
+    pub fn push_tool(&mut self, tool_name: &str, success: bool, result: &str) {
+        self.parts.push(Part::Tool {
+            tool_name: tool_name.to_string(),
+            success,
+            result: result.to_string(),
+        });
+    }
+}
+
+/// Global application state.
 pub struct TuiApp {
-    /// Ordered chat messages (oldest first).
     pub messages: Vec<Message>,
-    /// Current input text (simple single-line edit buffer).
     pub input: String,
-    /// Cursor position in the input buffer (byte index).
     pub cursor: usize,
-    /// Top status bar text.
     pub status: String,
-    /// Whether an agent is currently running (disables input, shows spinner).
     pub agent_running: bool,
-    /// Model description for the status bar.
     pub model_desc: String,
-    /// Whether the terminal size changed.
     pub needs_resize: bool,
 }
 
@@ -48,46 +91,44 @@ impl TuiApp {
         }
     }
 
-    /// Push a user message and clear the input.
     pub fn submit_input(&mut self) -> String {
         let text = self.input.trim().to_string();
         if text.is_empty() {
             return String::new();
         }
-        self.messages.push(Message::User { text: text.clone() });
+        self.messages.push(Message::user(&text));
         self.input.clear();
         self.cursor = 0;
         text
     }
 
-    /// Push a system notification.
-    pub fn push_system(&mut self, text: &str) {
-        self.messages.push(Message::System {
-            text: text.to_string(),
-        });
+    /// Start a new assistant message (for streaming/agent runs).
+    pub fn begin_assistant(&mut self, agent: &str) -> &mut Message {
+        let short_model = self
+            .model_desc
+            .split(" · ")
+            .last()
+            .unwrap_or("?")
+            .to_string();
+        self.messages.push(Message::assistant(agent, &short_model));
+        self.messages.last_mut().unwrap()
     }
 
-    /// Push an agent response.
-    pub fn push_agent(&mut self, text: String) {
-        self.messages.push(Message::Agent { text });
+    /// Get the last assistant message (for appending parts while agent runs).
+    pub fn last_assistant_mut(&mut self) -> Option<&mut Message> {
+        self.messages
+            .iter_mut()
+            .rev()
+            .find(|m| matches!(m.role, MessageRole::Assistant { .. }))
     }
 
-    /// Push a tool call result.
-    pub fn push_tool(&mut self, tool_name: &str, success: bool, result_summary: &str) {
-        self.messages.push(Message::Tool {
-            tool_name: tool_name.to_string(),
-            success,
-            result_summary: result_summary.to_string(),
-        });
-    }
+    // ── Input editing helpers ──
 
-    /// Handle a character being typed.
     pub fn input_char(&mut self, c: char) {
         self.input.insert(self.cursor, c);
         self.cursor += c.len_utf8();
     }
 
-    /// Handle backspace.
     pub fn input_backspace(&mut self) {
         if self.cursor > 0 {
             let prev = self.input[..self.cursor]
@@ -100,7 +141,6 @@ impl TuiApp {
         }
     }
 
-    /// Handle delete.
     pub fn input_delete(&mut self) {
         if self.cursor < self.input.len() {
             let next = self.input[self.cursor..]
@@ -112,7 +152,6 @@ impl TuiApp {
         }
     }
 
-    /// Move cursor left.
     pub fn cursor_left(&mut self) {
         if self.cursor > 0 {
             self.cursor = self.input[..self.cursor]
@@ -123,7 +162,6 @@ impl TuiApp {
         }
     }
 
-    /// Move cursor right.
     pub fn cursor_right(&mut self) {
         if self.cursor < self.input.len() {
             self.cursor = self.input[self.cursor..]
@@ -134,12 +172,9 @@ impl TuiApp {
         }
     }
 
-    /// Move cursor to start.
     pub fn cursor_home(&mut self) {
         self.cursor = 0;
     }
-
-    /// Move cursor to end.
     pub fn cursor_end(&mut self) {
         self.cursor = self.input.len();
     }
