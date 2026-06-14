@@ -9,6 +9,7 @@ mod feishu;
 mod llm_provider;
 mod repl;
 mod runner;
+mod tui;
 
 use std::sync::Arc;
 
@@ -32,8 +33,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // CLI mode dispatch
     let mode = std::env::args().nth(1).unwrap_or_default();
 
-    if mode == "repl" {
-        return run_repl().await;
+    if mode == "repl" || mode == "tui" {
+        return run_cli(mode == "tui").await;
     }
 
     // ── Server mode (default) ──
@@ -138,8 +139,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-/// Interactive REPL mode — no server, just stdin/stdout chat.
-async fn run_repl() -> Result<(), Box<dyn std::error::Error>> {
+/// CLI mode (REPL or TUI) — no server, just local interaction.
+async fn run_cli(force_tui: bool) -> Result<(), Box<dyn std::error::Error>> {
     // Minimal logger so `log::warn!` from the supervisor / experts is
     // visible on stderr without spamming the REPL prompt on stdout.
     let _ = env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("warn"))
@@ -148,7 +149,7 @@ async fn run_repl() -> Result<(), Box<dyn std::error::Error>> {
     let config_path = std::env::var("ASSISTANT_CONFIG")
         .unwrap_or_else(|_| "/opt/personal-assistant/config.yaml".to_string());
 
-    // REPL uses defaults when no config file exists — just print a note.
+    // Use defaults when no config file exists — just print a note.
     let app_config = if std::path::Path::new(&config_path).exists() {
         AppConfig::from_file(&config_path)?
     } else {
@@ -163,7 +164,12 @@ async fn run_repl() -> Result<(), Box<dyn std::error::Error>> {
         tool_auth.audit_log_path = "/tmp/personal-assistant-audit.log".into();
     }
     let auth = Arc::new(ToolAuthInterceptor::new(tool_auth)?);
-    repl::run(app_config, auth).await;
+
+    if force_tui {
+        tui::run_tui(app_config, auth).await;
+    } else {
+        repl::run(app_config, auth).await;
+    }
     Ok(())
 }
 

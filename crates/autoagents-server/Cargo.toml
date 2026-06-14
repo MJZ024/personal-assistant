@@ -36,6 +36,9 @@ async-trait = { workspace = true }
 log = { workspace = true }
 env_logger = { workspace = true }
 dotenvy = "0.15"
+crossterm = { version = "0.28", features = ["event-stream"] }
+futures-util = { workspace = true }
+ratatui = { version = "0.30", features = ["crossterm"] }
 chrono = { workspace = true }
 uuid = { workspace = true }
 reqwest = { workspace = true, features = ["json", "multipart"] }
