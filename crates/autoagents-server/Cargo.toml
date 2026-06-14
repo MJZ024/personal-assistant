@@ -35,6 +35,7 @@ thiserror = { workspace = true }
 async-trait = { workspace = true }
 log = { workspace = true }
 env_logger = { workspace = true }
+dotenvy = "0.15"
 chrono = { workspace = true }
 uuid = { workspace = true }
 reqwest = { workspace = true, features = ["json", "multipart"] }

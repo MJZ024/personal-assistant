@@ -25,11 +25,6 @@ pub async fn run(app_config: AppConfig, auth: Arc<ToolAuthInterceptor>) {
         ..Default::default()
     };
     let database = Arc::new(Database::open(&memory).expect("in-memory db"));
-    let supervisor = Arc::new(tokio::sync::Mutex::new(Supervisor::new(
-        app_config.supervisor.clone(),
-        database,
-    )));
-
     let llm = match crate::llm_provider::build_any_llm("coding", &app_config.models) {
         Ok(llm) => llm,
         Err(e) => {
@@ -37,6 +32,10 @@ pub async fn run(app_config: AppConfig, auth: Arc<ToolAuthInterceptor>) {
             return;
         }
     };
+
+    let supervisor = Arc::new(tokio::sync::Mutex::new(
+        Supervisor::new(app_config.supervisor.clone(), database).with_chat_llm(llm.clone()),
+    ));
 
     let expert_ctx = crate::runner::make_expert_context(
         auth,

@@ -20,6 +20,8 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use uuid::Uuid;
 
+use autoagents_llm::LLMProvider;
+use autoagents_llm::chat::ChatMessage;
 use autoagents_memory::{Database, Heartbeat, HeartbeatConfig, TaskRecord, TaskStatus};
 
 /// Configuration for the supervisor agent.
@@ -46,6 +48,8 @@ pub struct Supervisor {
     database: Arc<Database>,
     session_manager: SessionManager,
     dispatcher: ExpertDispatcher,
+    /// Optional LLM for direct conversational replies (Query intent).
+    chat_llm: Option<Arc<dyn LLMProvider>>,
     /// How many tasks are currently executing.
     active_count: usize,
     /// Queue of pending task IDs waiting for a slot.
@@ -59,9 +63,18 @@ impl Supervisor {
             database,
             session_manager: SessionManager::new(),
             dispatcher: ExpertDispatcher::new(),
+            chat_llm: None,
             active_count: 0,
             pending_queue: Vec::new(),
         }
+    }
+
+    /// Attach an LLM for direct conversational replies (Query intent and
+    /// general questions that don't route to a specialist agent). When unset,
+    /// queries fall back to an acknowledgement echo.
+    pub fn with_chat_llm(mut self, llm: Arc<dyn LLMProvider>) -> Self {
+        self.chat_llm = Some(llm);
+        self
     }
 
     /// Process an incoming user message.
@@ -243,8 +256,34 @@ impl Supervisor {
         }
     }
 
-    /// Handle a general query.
+    /// Handle a general query — answered directly by the chat LLM when one is
+    /// attached, otherwise an acknowledgement echo.
     async fn handle_query(&self, question: &str) -> Result<SupervisorResponse, SupervisorError> {
+        if let Some(llm) = &self.chat_llm {
+            let prompt = format!(
+                "你是一个运行在 Linux 服务器上的个人助理，通过飞书 Bot 与用户交互。\
+                 用简洁的中文回答用户的问题。如果用户想要执行具体操作（写文件、\
+                 跑命令、查系统状态、管理服务等），请提示他们更明确地描述任务，\
+                 例如「帮我列出 /tmp 下的文件」或「查看系统状态」。\n\n用户: {question}"
+            );
+            let messages = vec![ChatMessage::user().content(prompt).build()];
+            match llm.chat(&messages, None).await {
+                Ok(resp) => {
+                    let text = resp
+                        .text()
+                        .unwrap_or_else(|| "(模型未返回文本内容)".to_string());
+                    return Ok(SupervisorResponse {
+                        message: text,
+                        task_id: None,
+                        task_type: None,
+                        description: None,
+                        requires_confirmation: false,
+                    });
+                }
+                Err(e) => log::warn!("chat LLM error, falling back to echo: {e}"),
+            }
+        }
+        // Fallback when no LLM is attached or the call failed.
         Ok(SupervisorResponse {
             message: format!("收到你的问题，我来处理: {}", question),
             task_id: None,
